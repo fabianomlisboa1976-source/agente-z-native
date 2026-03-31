@@ -11,29 +11,32 @@ interface AuditLogDao {
     @Query("SELECT * FROM audit_logs ORDER BY timestamp DESC")
     fun getAllLogs(): Flow<List<AuditLog>>
     
-    @Query("SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT :limit")
-    suspend fun getRecentLogs(limit: Int): List<AuditLog>
-    
     @Query("SELECT * FROM audit_logs WHERE type = :type ORDER BY timestamp DESC")
-    fun getLogsByType(type: AuditLog.AuditType): Flow<List<AuditLog>>
-    
-    @Query("SELECT * FROM audit_logs WHERE agent_id = :agentId ORDER BY timestamp DESC")
-    fun getLogsByAgent(agentId: String): Flow<List<AuditLog>>
+    fun getLogsByType(type: String): Flow<List<AuditLog>>
     
     @Query("SELECT * FROM audit_logs WHERE status = :status ORDER BY timestamp DESC")
-    fun getLogsByStatus(status: AuditLog.Status): Flow<List<AuditLog>>
+    fun getLogsByStatus(status: String): Flow<List<AuditLog>>
     
-    @Query("SELECT * FROM audit_logs WHERE timestamp BETWEEN :startDate AND :endDate ORDER BY timestamp DESC")
-    suspend fun getLogsBetweenDates(startDate: Date, endDate: Date): List<AuditLog>
+    @Query("SELECT * FROM audit_logs WHERE agentId = :agentId ORDER BY timestamp DESC")
+    fun getLogsByAgent(agentId: String): Flow<List<AuditLog>>
     
-    @Query("SELECT * FROM audit_logs WHERE timestamp > :since ORDER BY timestamp DESC")
-    suspend fun getLogsSince(since: Date): List<AuditLog>
+    @Query("SELECT * FROM audit_logs WHERE correlationId = :correlationId ORDER BY timestamp ASC")
+    suspend fun getLogsByCorrelation(correlationId: String): List<AuditLog>
     
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Query("SELECT * FROM audit_logs WHERE timestamp >= :since ORDER BY timestamp DESC")
+    fun getLogsSince(since: Date): Flow<List<AuditLog>>
+    
+    @Query("SELECT * FROM audit_logs WHERE timestamp >= :since AND timestamp <= :until ORDER BY timestamp DESC")
+    fun getLogsBetween(since: Date, until: Date): Flow<List<AuditLog>>
+    
+    @Insert
     suspend fun insertLog(log: AuditLog): Long
     
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert
     suspend fun insertLogs(logs: List<AuditLog>)
+    
+    @Update
+    suspend fun updateLog(log: AuditLog)
     
     @Delete
     suspend fun deleteLog(log: AuditLog)
@@ -50,24 +53,12 @@ interface AuditLogDao {
     @Query("SELECT COUNT(*) FROM audit_logs")
     suspend fun getLogCount(): Int
     
-    @Query("SELECT COUNT(*) FROM audit_logs WHERE type = :type")
-    suspend fun getLogCountByType(type: AuditLog.AuditType): Int
+    @Query("SELECT COUNT(*) FROM audit_logs WHERE status = 'ERROR'")
+    suspend fun getErrorCount(): Int
     
-    @Query("SELECT COUNT(*) FROM audit_logs WHERE status = :status")
-    suspend fun getLogCountByStatus(status: AuditLog.Status): Int
-    
-    @Query("SELECT * FROM audit_logs WHERE correlation_id = :correlationId ORDER BY timestamp ASC")
-    suspend fun getLogsByCorrelationId(correlationId: String): List<AuditLog>
-    
-    @Query("UPDATE audit_logs SET is_synced = 1 WHERE id = :logId")
+    @Query("UPDATE audit_logs SET isSynced = 1 WHERE id = :logId")
     suspend fun markAsSynced(logId: Long)
     
-    @Query("SELECT * FROM audit_logs WHERE is_synced = 0 ORDER BY timestamp ASC")
+    @Query("SELECT * FROM audit_logs WHERE isSynced = 0 ORDER BY timestamp ASC")
     suspend fun getUnsyncedLogs(): List<AuditLog>
-    
-    @Query("SELECT * FROM audit_logs WHERE action LIKE '%' || :query || '%' OR details LIKE '%' || :query || '%' ORDER BY timestamp DESC")
-    suspend fun searchLogs(query: String): List<AuditLog>
-    
-    @Query("SELECT AVG(duration_ms) FROM audit_logs WHERE duration_ms IS NOT NULL")
-    suspend fun getAverageDuration(): Double?
 }

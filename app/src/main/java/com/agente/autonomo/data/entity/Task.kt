@@ -5,9 +5,6 @@ import androidx.room.PrimaryKey
 import androidx.room.ColumnInfo
 import java.util.Date
 
-/**
- * Entidade para tarefas agendadas ou pendentes
- */
 @Entity(tableName = "tasks")
 data class Task(
     @PrimaryKey

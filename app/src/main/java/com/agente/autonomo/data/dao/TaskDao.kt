@@ -17,17 +17,11 @@ interface TaskDao {
     @Query("SELECT * FROM tasks WHERE status IN ('PENDING', 'IN_PROGRESS') ORDER BY priority DESC, dueDate ASC")
     suspend fun getPendingTasks(): List<Task>
     
-    @Query("SELECT * FROM tasks WHERE assignedAgent = :agentId AND status = 'PENDING' ORDER BY priority DESC")
-    suspend fun getPendingTasksForAgent(agentId: String): List<Task>
-    
     @Query("SELECT * FROM tasks WHERE id = :taskId LIMIT 1")
     suspend fun getTaskById(taskId: String): Task?
     
     @Query("SELECT * FROM tasks WHERE type = :type ORDER BY createdAt DESC")
     fun getTasksByType(type: String): Flow<List<Task>>
-    
-    @Query("SELECT * FROM tasks WHERE dueDate <= :now AND status = 'SCHEDULED' ORDER BY priority DESC")
-    suspend fun getScheduledTasksDue(now: Date = Date()): List<Task>
     
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertTask(task: Task)
@@ -43,9 +37,6 @@ interface TaskDao {
     
     @Query("DELETE FROM tasks WHERE id = :taskId")
     suspend fun deleteTaskById(taskId: String)
-    
-    @Query("DELETE FROM tasks WHERE status = 'COMPLETED' AND completedAt < :before")
-    suspend fun deleteCompletedTasksBefore(before: Date)
     
     @Query("DELETE FROM tasks")
     suspend fun deleteAllTasks()
@@ -68,15 +59,9 @@ interface TaskDao {
     @Query("SELECT COUNT(*) FROM tasks")
     suspend fun getTaskCount(): Int
     
-    @Query("SELECT COUNT(*) FROM tasks WHERE status = :status")
-    suspend fun getTaskCountByStatus(status: String): Int
-    
     @Query("SELECT * FROM tasks WHERE parentTaskId = :parentId ORDER BY createdAt ASC")
     suspend fun getSubTasks(parentId: String): List<Task>
     
     @Query("SELECT * FROM tasks WHERE tags LIKE '%' || :tag || '%' ORDER BY createdAt DESC")
     suspend fun getTasksByTag(tag: String): List<Task>
-    
-    @Query("SELECT * FROM tasks WHERE dueDate < :now AND status NOT IN ('COMPLETED', 'CANCELLED') ORDER BY dueDate ASC")
-    suspend fun getOverdueTasks(now: Date = Date()): List<Task>
 }

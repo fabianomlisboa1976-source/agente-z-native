@@ -5,9 +5,6 @@ import androidx.room.PrimaryKey
 import androidx.room.ColumnInfo
 import java.util.Date
 
-/**
- * Entidade para logs de auditoria
- */
 @Entity(tableName = "audit_logs")
 data class AuditLog(
     @PrimaryKey(autoGenerate = true)
@@ -17,12 +14,12 @@ data class AuditLog(
     val timestamp: Date = Date(),
     
     @ColumnInfo(name = "type")
-    val type: AuditType,
+    val type: String = "ACTION",
     
-    @ColumnInfo(name = "agent_id")
+    @ColumnInfo(name = "agentId")
     val agentId: String? = null,
     
-    @ColumnInfo(name = "agent_name")
+    @ColumnInfo(name = "agentName")
     val agentName: String? = null,
     
     @ColumnInfo(name = "action")
@@ -31,42 +28,24 @@ data class AuditLog(
     @ColumnInfo(name = "details")
     val details: String? = null,
     
-    @ColumnInfo(name = "input_data")
+    @ColumnInfo(name = "inputData")
     val inputData: String? = null,
     
-    @ColumnInfo(name = "output_data")
+    @ColumnInfo(name = "outputData")
     val outputData: String? = null,
     
     @ColumnInfo(name = "status")
-    val status: Status = Status.SUCCESS,
+    val status: String = "SUCCESS",
     
-    @ColumnInfo(name = "error_message")
+    @ColumnInfo(name = "errorMessage")
     val errorMessage: String? = null,
     
-    @ColumnInfo(name = "duration_ms")
+    @ColumnInfo(name = "durationMs")
     val durationMs: Long? = null,
     
-    @ColumnInfo(name = "correlation_id")
+    @ColumnInfo(name = "correlationId")
     val correlationId: String? = null,
     
-    @ColumnInfo(name = "is_synced")
+    @ColumnInfo(name = "isSynced")
     val isSynced: Boolean = false
-) {
-    enum class AuditType {
-        REQUEST,        // Requisição para API
-        RESPONSE,       // Resposta da API
-        ACTION,         // Ação executada
-        ERROR,          // Erro ocorrido
-        SYSTEM,         // Evento do sistema
-        SECURITY,       // Evento de segurança
-        USER_ACTION,    // Ação do usuário
-        AGENT_DECISION  // Decisão de agente
-    }
-    
-    enum class Status {
-        SUCCESS,
-        WARNING,
-        ERROR,
-        PENDING
-    }
-}
+)

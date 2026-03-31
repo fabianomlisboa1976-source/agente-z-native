@@ -2,184 +2,157 @@ package com.agente.autonomo.utils
 
 import com.agente.autonomo.data.dao.AuditLogDao
 import com.agente.autonomo.data.entity.AuditLog
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import java.util.UUID
+import java.util.Date
 
-/**
- * Utilitário para registro de auditoria
- */
-class AuditLogger(private val auditLogDao: AuditLogDao) {
+class AuditLogger(private val dao: AuditLogDao) {
     
-    private val scope = CoroutineScope(Dispatchers.IO)
-    
-    fun log(
-        type: AuditLog.AuditType,
+    suspend fun logAction(
         action: String,
         agentId: String? = null,
         agentName: String? = null,
         details: String? = null,
         inputData: String? = null,
         outputData: String? = null,
-        status: AuditLog.Status = AuditLog.Status.SUCCESS,
-        errorMessage: String? = null,
         durationMs: Long? = null,
         correlationId: String? = null
     ) {
-        scope.launch {
-            try {
-                val log = AuditLog(
-                    type = type,
-                    action = action,
-                    agentId = agentId,
-                    agentName = agentName,
-                    details = details,
-                    inputData = inputData,
-                    outputData = outputData,
-                    status = status,
-                    errorMessage = errorMessage,
-                    durationMs = durationMs,
-                    correlationId = correlationId ?: UUID.randomUUID().toString()
-                )
-                auditLogDao.insertLog(log)
-            } catch (e: Exception) {
-                // Silenciar erro de logging para não quebrar o fluxo
-                e.printStackTrace()
-            }
-        }
-    }
-    
-    fun logRequest(
-        action: String,
-        inputData: String? = null,
-        agentId: String? = null,
-        correlationId: String? = null
-    ) {
-        log(
-            type = AuditLog.AuditType.REQUEST,
-            action = action,
-            agentId = agentId,
-            inputData = inputData,
-            correlationId = correlationId
-        )
-    }
-    
-    fun logResponse(
-        action: String,
-        outputData: String? = null,
-        agentId: String? = null,
-        durationMs: Long? = null,
-        correlationId: String? = null
-    ) {
-        log(
-            type = AuditLog.AuditType.RESPONSE,
-            action = action,
-            agentId = agentId,
-            outputData = outputData,
-            durationMs = durationMs,
-            correlationId = correlationId
-        )
-    }
-    
-    fun logAction(
-        action: String,
-        agentId: String? = null,
-        agentName: String? = null,
-        details: String? = null,
-        durationMs: Long? = null
-    ) {
-        log(
-            type = AuditLog.AuditType.ACTION,
-            action = action,
+        dao.insertLog(AuditLog(
+            type = "ACTION",
             agentId = agentId,
             agentName = agentName,
+            action = action,
             details = details,
-            durationMs = durationMs
-        )
+            inputData = inputData,
+            outputData = outputData,
+            durationMs = durationMs,
+            correlationId = correlationId,
+            status = "SUCCESS"
+        ))
     }
     
-    fun logError(
+    suspend fun logError(
         action: String,
         error: String,
         agentId: String? = null,
-        details: String? = null
-    ) {
-        log(
-            type = AuditLog.AuditType.ERROR,
-            action = action,
-            agentId = agentId,
-            details = details,
-            status = AuditLog.Status.ERROR,
-            errorMessage = error
-        )
-    }
-    
-    fun logSystem(
-        action: String,
-        details: String? = null
-    ) {
-        log(
-            type = AuditLog.AuditType.SYSTEM,
-            action = action,
-            details = details
-        )
-    }
-    
-    fun logSecurity(
-        action: String,
-        details: String? = null,
-        status: AuditLog.Status = AuditLog.Status.SUCCESS
-    ) {
-        log(
-            type = AuditLog.AuditType.SECURITY,
-            action = action,
-            details = details,
-            status = status
-        )
-    }
-    
-    fun logUserAction(
-        action: String,
-        details: String? = null
-    ) {
-        log(
-            type = AuditLog.AuditType.USER_ACTION,
-            action = action,
-            details = details
-        )
-    }
-    
-    fun logAgentDecision(
-        action: String,
-        agentId: String,
-        agentName: String,
-        details: String? = null,
-        outputData: String? = null,
+        agentName: String? = null,
+        inputData: String? = null,
+        durationMs: Long? = null,
         correlationId: String? = null
     ) {
-        log(
-            type = AuditLog.AuditType.AGENT_DECISION,
-            action = action,
+        dao.insertLog(AuditLog(
+            type = "ERROR",
             agentId = agentId,
             agentName = agentName,
-            details = details,
-            outputData = outputData,
-            correlationId = correlationId
-        )
+            action = action,
+            inputData = inputData,
+            errorMessage = error,
+            durationMs = durationMs,
+            correlationId = correlationId,
+            status = "ERROR"
+        ))
     }
     
-    fun logWarning(
+    suspend fun logWarning(
         action: String,
         details: String? = null,
-        agentId: String? = null
+        agentId: String? = null,
+        correlationId: String? = null
     ) {
-        log(
-            type = AuditLog.AuditType.SYSTEM,
-            action = action,
+        dao.insertLog(AuditLog(
+            type = "ACTION",
             agentId = agentId,
+            action = action,
             details = details,
-            status = AuditLog.Status.WARNING
-        )
+            correlationId = correlationId,
+            status = "WARNING"
+        ))
+    }
+    
+    suspend fun logSystem(
+        message: String,
+        correlationId: String? = null
+    ) {
+        dao.insertLog(AuditLog(
+            type = "SYSTEM",
+            action = message,
+            correlationId = correlationId,
+            status = "SUCCESS"
+        ))
+    }
+    
+    suspend fun logUserAction(
+        action: String,
+        details: String? = null,
+        inputData: String? = null
+    ) {
+        dao.insertLog(AuditLog(
+            type = "USER_ACTION",
+            action = action,
+            details = details,
+            inputData = inputData,
+            status = "SUCCESS"
+        ))
+    }
+    
+    suspend fun logAgentDecision(
+        action: String,
+        agentId: String?,
+        agentName: String?,
+        details: String?,
+        outputData: String?,
+        correlationId: String?
+    ) {
+        dao.insertLog(AuditLog(
+            type = "AGENT_DECISION",
+            agentId = agentId,
+            agentName = agentName,
+            action = action,
+            details = details,
+            outputData = outputData,
+            correlationId = correlationId,
+            status = "SUCCESS"
+        ))
+    }
+    
+    suspend fun logSecurity(
+        action: String,
+        details: String? = null
+    ) {
+        dao.insertLog(AuditLog(
+            type = "SECURITY",
+            action = action,
+            details = details,
+            status = "SUCCESS"
+        ))
+    }
+    
+    suspend fun logRequest(
+        action: String,
+        inputData: String?,
+        correlationId: String?
+    ) {
+        dao.insertLog(AuditLog(
+            type = "REQUEST",
+            action = action,
+            inputData = inputData,
+            correlationId = correlationId,
+            status = "PENDING"
+        ))
+    }
+    
+    suspend fun logResponse(
+        action: String,
+        outputData: String?,
+        durationMs: Long?,
+        correlationId: String?
+    ) {
+        dao.insertLog(AuditLog(
+            type = "RESPONSE",
+            action = action,
+            outputData = outputData,
+            durationMs = durationMs,
+            correlationId = correlationId,
+            status = "SUCCESS"
+        ))
     }
 }
