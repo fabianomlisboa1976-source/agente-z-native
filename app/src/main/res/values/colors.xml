@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Cores Principais -->
+    <color name="primary">#6366F1</color>
+    <color name="primary_dark">#4F46E5</color>
+    <color name="primary_light">#818CF8</color>
+    
+    <!-- Cores Secundárias -->
+    <color name="secondary">#10B981</color>
+    <color name="secondary_dark">#059669</color>
+    <color name="secondary_light">#34D399</color>
+    
+    <!-- Cores de Destaque -->
+    <color name="accent">#F59E0B</color>
+    <color name="accent_light">#FBBF24</color>
+    
+    <!-- Cores de Status -->
+    <color name="success">#22C55E</color>
+    <color name="warning">#F59E0B</color>
+    <color name="error">#EF4444</color>
+    <color name="info">#3B82F6</color>
+    
+    <!-- Cores de Fundo -->
+    <color name="background">#0F172A</color>
+    <color name="surface">#1E293B</color>
+    <color name="surface_variant">#334155</color>
+    
+    <!-- Cores de Texto -->
+    <color name="text_primary">#F8FAFC</color>
+    <color name="text_secondary">#94A3B8</color>
+    <color name="text_disabled">#64748B</color>
+    
+    <!-- Cores de Mensagens -->
+    <color name="message_user_background">#4F46E5</color>
+    <color name="message_agent_background">#334155</color>
+    <color name="message_system_background">#1E293B</color>
+    
+    <!-- Cores de Agentes -->
+    <color name="agent_coordinator">#8B5CF6</color>
+    <color name="agent_planner">#3B82F6</color>
+    <color name="agent_researcher">#10B981</color>
+    <color name="agent_executor">#F59E0B</color>
+    <color name="agent_auditor">#EF4444</color>
+    <color name="agent_memory">#EC4899</color>
+    <color name="agent_communication">#06B6D4</color>
+    
+    <!-- Cores de Notificação -->
+    <color name="notification_background">#1E293B</color>
+    <color name="notification_icon">#6366F1</color>
+    
+    <!-- Cores de Borda -->
+    <color name="border">#334155</color>
+    <color name="divider">#334155</color>
+    
+    <!-- Cores de Seleção -->
+    <color name="selected">#6366F1</color>
+    <color name="selected_background">#1E1B4B</color>
+    
+    <!-- Cores de Input -->
+    <color name="input_background">#1E293B</color>
+    <color name="input_border">#475569</color>
+    <color name="input_hint">#64748B</color>
+    
+    <!-- Cores de Botão -->
+    <color name="button_primary">#6366F1</color>
+    <color name="button_primary_pressed">#4F46E5</color>
+    <color name="button_secondary">#334155</color>
+    <color name="button_disabled">#475569</color>
+    
+    <!-- Cores de Card -->
+    <color name="card_background">#1E293B</color>
+    <color name="card_elevation">#0F172A</color>
+    
+    <!-- Cores de Scrollbar -->
+    <color name="scrollbar_thumb">#475569</color>
+    <color name="scrollbar_track">#1E293B</color>
+    
+    <!-- Cores de Ripple -->
+    <color name="ripple">#6366F1</color>
+    <color name="ripple_light">#818CF8</color>
+</resources>

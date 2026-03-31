@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Agente Z</string>
+    
+    <!-- Títulos -->
+    <string name="settings_title">Configurações</string>
+    <string name="agents_title">Agentes</string>
+    <string name="audit_title">Auditoria</string>
+    <string name="chat_title">Chat</string>
+    
+    <!-- Navegação -->
+    <string name="nav_chat">Chat</string>
+    <string name="nav_agents">Agentes</string>
+    <string name="nav_settings">Configurações</string>
+    <string name="nav_audit">Auditoria</string>
+    
+    <!-- Botões -->
+    <string name="btn_send">Enviar</string>
+    <string name="btn_start_service">Iniciar Serviço</string>
+    <string name="btn_stop_service">Parar Serviço</string>
+    <string name="btn_save">Salvar</string>
+    <string name="btn_cancel">Cancelar</string>
+    <string name="btn_add">Adicionar</string>
+    <string name="btn_delete">Excluir</string>
+    <string name="btn_edit">Editar</string>
+    <string name="btn_test">Testar</string>
+    
+    <!-- Configurações -->
+    <string name="setting_api_key">Chave da API</string>
+    <string name="setting_api_provider">Provedor de API</string>
+    <string name="setting_model">Modelo LLM</string>
+    <string name="setting_max_tokens">Máximo de Tokens</string>
+    <string name="setting_temperature">Temperatura</string>
+    <string name="setting_auto_start">Iniciar Automaticamente</string>
+    <string name="setting_notifications">Notificações</string>
+    <string name="setting_audit_enabled">Auditoria Ativada</string>
+    
+    <!-- Provedores de API -->
+    <string name="provider_groq">Groq (Recomendado)</string>
+    <string name="provider_openrouter">OpenRouter</string>
+    <string name="provider_cloudflare">Cloudflare</string>
+    <string name="provider_github">GitHub Models</string>
+    
+    <!-- Modelos -->
+    <string name="model_llama3_8b">Llama 3.1 8B</string>
+    <string name="model_llama3_70b">Llama 3.1 70B</string>
+    <string name="model_mixtral_8x7b">Mixtral 8x7B</string>
+    <string name="model_mistral_7b">Mistral 7B</string>
+    <string name="model_phi3_mini">Phi-3 Mini</string>
+    <string name="model_gemma_7b">Gemma 7B</string>
+    <string name="model_qwen_7b">Qwen 2.5 7B</string>
+    
+    <!-- Agentes -->
+    <string name="agent_coordinator">Coordenador</string>
+    <string name="agent_planner">Planejador</string>
+    <string name="agent_researcher">Pesquisador</string>
+    <string name="agent_executor">Executor</string>
+    <string name="agent_auditor">Auditor</string>
+    <string name="agent_memory">Memória</string>
+    <string name="agent_communication">Comunicação</string>
+    
+    <!-- Status -->
+    <string name="status_online">Online</string>
+    <string name="status_offline">Offline</string>
+    <string name="status_processing">Processando…</string>
+    <string name="status_waiting">Aguardando…</string>
+    <string name="status_error">Erro</string>
+    
+    <!-- Mensagens -->
+    <string name="msg_service_started">Serviço iniciado</string>
+    <string name="msg_service_stopped">Serviço parado</string>
+    <string name="msg_service_running">Serviço em execução</string>
+    <string name="msg_enter_message">Digite uma mensagem…</string>
+    <string name="msg_no_messages">Nenhuma mensagem ainda</string>
+    <string name="msg_permission_required">Permissão necessária</string>
+    <string name="msg_permission_denied">Permissão negada</string>
+    <string name="msg_settings_saved">Configurações salvas</string>
+    <string name="msg_agent_created">Agente criado</string>
+    <string name="msg_agent_updated">Agente atualizado</string>
+    <string name="msg_agent_deleted">Agente excluído</string>
+    <string name="msg_api_error">Erro na API</string>
+    <string name="msg_network_error">Erro de conexão</string>
+    <string name="msg_retry">Tentar novamente</string>
+    
+    <!-- Notificações -->
+    <string name="notification_channel_name">Agente Autônomo</string>
+    <string name="notification_channel_description">Notificações do serviço em background</string>
+    <string name="notification_title">Agente Autônomo Ativo</string>
+    <string name="notification_text">O agente está monitorando e executando tarefas</string>
+    <string name="notification_action_stop">Parar</string>
+    <string name="notification_action_open">Abrir</string>
+    
+    <!-- Auditoria -->
+    <string name="audit_type_request">Requisição</string>
+    <string name="audit_type_response">Resposta</string>
+    <string name="audit_type_action">Ação</string>
+    <string name="audit_type_error">Erro</string>
+    <string name="audit_type_system">Sistema</string>
+    <string name="audit_filter_all">Todos</string>
+    <string name="audit_filter_today">Hoje</string>
+    <string name="audit_filter_week">Esta Semana</string>
+    <string name="audit_filter_month">Este Mês</string>
+    <string name="audit_clear">Limpar Logs</string>
+    <string name="audit_export">Exportar</string>
+    
+    <!-- Diálogos -->
+    <string name="dialog_confirm_title">Confirmação</string>
+    <string name="dialog_confirm_delete">Deseja realmente excluir?</string>
+    <string name="dialog_confirm_clear_logs">Deseja limpar todos os logs?</string>
+    <string name="dialog_yes">Sim</string>
+    <string name="dialog_no">Não</string>
+    <string name="dialog_ok">OK</string>
+    
+    <!-- Erros -->
+    <string name="error_generic">Ocorreu um erro</string>
+    <string name="error_invalid_api_key">Chave de API inválida</string>
+    <string name="error_rate_limit">Limite de requisições excedido</string>
+    <string name="error_no_internet">Sem conexão com a internet</string>
+    <string name="error_service_not_running">Serviço não está rodando</string>
+    
+    <!-- Sobre -->
+    <string name="about_version">Versão 1.0.0</string>
+    <string name="about_description">Agente Autônomo Multi-Agente com LLM</string>
+    <string name="about_features">Recursos: Chatbot, Múltiplos Agentes, Banco Local, Execução 24/7</string>
+</resources>
