@@ -13,6 +13,9 @@ data class Task(
     @PrimaryKey
     val id: String,
     
+    @ColumnInfo(name = "userId")
+    val userId: String? = null,
+    
     @ColumnInfo(name = "title")
     val title: String,
     
@@ -20,34 +23,37 @@ data class Task(
     val description: String? = null,
     
     @ColumnInfo(name = "type")
-    val type: TaskType,
+    val type: String = "CUSTOM",
     
     @ColumnInfo(name = "status")
-    val status: TaskStatus = TaskStatus.PENDING,
+    val status: String = "PENDING",
     
     @ColumnInfo(name = "priority")
-    val priority: TaskPriority = TaskPriority.MEDIUM,
+    val priority: String = "MEDIUM",
     
-    @ColumnInfo(name = "assigned_agent")
+    @ColumnInfo(name = "assignedAgent")
     val assignedAgent: String? = null,
     
-    @ColumnInfo(name = "created_at")
+    @ColumnInfo(name = "createdAt")
     val createdAt: Date = Date(),
     
-    @ColumnInfo(name = "scheduled_at")
+    @ColumnInfo(name = "updatedAt")
+    val updatedAt: Date = Date(),
+    
+    @ColumnInfo(name = "scheduledAt")
     val scheduledAt: Date? = null,
     
-    @ColumnInfo(name = "started_at")
+    @ColumnInfo(name = "startedAt")
     val startedAt: Date? = null,
     
-    @ColumnInfo(name = "completed_at")
+    @ColumnInfo(name = "completedAt")
     val completedAt: Date? = null,
     
-    @ColumnInfo(name = "due_date")
+    @ColumnInfo(name = "dueDate")
     val dueDate: Date? = null,
     
     @ColumnInfo(name = "parameters")
-    val parameters: String? = null, // JSON com parâmetros
+    val parameters: String? = null,
     
     @ColumnInfo(name = "result")
     val result: String? = null,
@@ -55,49 +61,24 @@ data class Task(
     @ColumnInfo(name = "error")
     val error: String? = null,
     
-    @ColumnInfo(name = "retry_count")
+    @ColumnInfo(name = "retryCount")
     val retryCount: Int = 0,
     
-    @ColumnInfo(name = "max_retries")
+    @ColumnInfo(name = "maxRetries")
     val maxRetries: Int = 3,
     
-    @ColumnInfo(name = "parent_task_id")
+    @ColumnInfo(name = "parentTaskId")
     val parentTaskId: String? = null,
     
     @ColumnInfo(name = "tags")
-    val tags: String? = null, // JSON array de tags
+    val tags: String? = null,
     
-    @ColumnInfo(name = "is_recurring")
+    @ColumnInfo(name = "category")
+    val category: String? = null,
+    
+    @ColumnInfo(name = "isRecurring")
     val isRecurring: Boolean = false,
     
-    @ColumnInfo(name = "recurrence_rule")
+    @ColumnInfo(name = "recurrenceRule")
     val recurrenceRule: String? = null
-) {
-    enum class TaskType {
-        API_CALL,
-        DATA_PROCESSING,
-        NOTIFICATION,
-        REMINDER,
-        RESEARCH,
-        COMMUNICATION,
-        FILE_OPERATION,
-        CUSTOM
-    }
-    
-    enum class TaskStatus {
-        PENDING,
-        SCHEDULED,
-        RUNNING,
-        COMPLETED,
-        FAILED,
-        CANCELLED,
-        RETRYING
-    }
-    
-    enum class TaskPriority {
-        LOW,
-        MEDIUM,
-        HIGH,
-        CRITICAL
-    }
-}
+)

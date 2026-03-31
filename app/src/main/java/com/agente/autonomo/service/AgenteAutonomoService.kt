@@ -11,7 +11,7 @@ import com.agente.autonomo.R
 import com.agente.autonomo.api.MemoryApiClient
 import com.agente.autonomo.data.database.AppDatabase
 import com.agente.autonomo.data.entity.Message
-import com.agente.autonomo.data.entity.AuditLog
+import com.agente.autonomo.data.entity.Task
 import kotlinx.coroutines.*
 import java.util.UUID
 
@@ -42,7 +42,6 @@ class AgenteAutonomoService : Service() {
         var isRunning = false
             private set
         
-        // Callback para notificar quando a resposta estiver pronta
         var onResponseReady: ((String) -> Unit)? = null
     }
 
@@ -61,10 +60,8 @@ class AgenteAutonomoService : Service() {
         database = AppDatabase.getDatabase(this)
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         
-        // Carregar userId salvo
         userId = prefs.getString(PREF_USER_ID, null)
         
-        // Inicializar cliente de memória
         val apiUrl = prefs.getString(PREF_API_URL, MemoryApiClient.DEFAULT_BASE_URL) ?: MemoryApiClient.DEFAULT_BASE_URL
         memoryClient = MemoryApiClient(apiUrl)
         
@@ -75,12 +72,8 @@ class AgenteAutonomoService : Service() {
         Log.d(TAG, "onStartCommand: ${intent?.action}")
         
         when (intent?.action) {
-            ACTION_START -> {
-                startService()
-            }
-            ACTION_STOP -> {
-                stopService()
-            }
+            ACTION_START -> startService()
+            ACTION_STOP -> stopService()
             ACTION_PROCESS_MESSAGE -> {
                 val message = intent.getStringExtra(EXTRA_MESSAGE)
                 val conversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID) ?: "default"
@@ -102,9 +95,12 @@ class AgenteAutonomoService : Service() {
         isRunning = false
         serviceScope.cancel()
         
-        // Enviar broadcast para reiniciar o serviço
-        val broadcastIntent = Intent(this, RestartService::class.java)
-        sendBroadcast(broadcastIntent)
+        try {
+            val broadcastIntent = Intent(this, RestartService::class.java)
+            sendBroadcast(broadcastIntent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao enviar broadcast de restart", e)
+        }
     }
 
     private fun startService() {
@@ -115,18 +111,15 @@ class AgenteAutonomoService : Service() {
         
         Log.d(TAG, "Iniciando serviço...")
         
-        // Criar notificação persistente
         val notification = createNotification()
         startForeground(NOTIFICATION_ID, notification)
         
         isRunning = true
         
-        // Garantir que temos um userId
         serviceScope.launch {
             ensureUserId()
         }
         
-        // Iniciar heartbeat
         startHeartbeat()
         
         Log.d(TAG, "Serviço iniciado com sucesso")
@@ -146,10 +139,9 @@ class AgenteAutonomoService : Service() {
         heartbeatJob = serviceScope.launch {
             while (isActive && isRunning) {
                 try {
-                    // Log de heartbeat a cada 5 minutos
                     Log.d(TAG, "Heartbeat: Serviço ativo, userId=$userId")
                     updateNotification()
-                    delay(300000) // 5 minutos
+                    delay(300000)
                 } catch (e: Exception) {
                     Log.e(TAG, "Erro no heartbeat", e)
                 }
@@ -160,15 +152,12 @@ class AgenteAutonomoService : Service() {
     private suspend fun ensureUserId() {
         if (userId != null) return
         
-        // Tentar obter do cache
         userId = MemoryApiClient.getCachedUserId()
         if (userId != null) return
         
-        // Tentar obter das preferências
         userId = prefs.getString(PREF_USER_ID, null)
         if (userId != null) return
         
-        // Criar novo usuário
         val deviceId = UUID.randomUUID().toString().substring(0, 8)
         val email = "z_user_$deviceId@z-app.local"
         
@@ -193,7 +182,6 @@ class AgenteAutonomoService : Service() {
             try {
                 Log.d(TAG, "Processando mensagem: ${message.take(50)}...")
                 
-                // Garantir que temos userId
                 ensureUserId()
                 
                 val currentUserId = userId
@@ -202,7 +190,6 @@ class AgenteAutonomoService : Service() {
                     return@launch
                 }
                 
-                // Salvar mensagem do usuário localmente
                 val userMessage = Message(
                     senderType = Message.SenderType.USER,
                     content = message,
@@ -210,7 +197,6 @@ class AgenteAutonomoService : Service() {
                 )
                 database.messageDao().insertMessage(userMessage)
                 
-                // Enviar para o servidor de memória
                 val result = memoryClient?.sendChatMessage(
                     currentUserId,
                     message,
@@ -220,7 +206,6 @@ class AgenteAutonomoService : Service() {
                 if (result?.isSuccess == true) {
                     val response = result.getOrNull()
                     if (response != null) {
-                        // Salvar resposta do agente
                         val agentMessage = Message(
                             senderType = Message.SenderType.AGENT,
                             content = response.response,
@@ -231,14 +216,11 @@ class AgenteAutonomoService : Service() {
                         database.messageDao().insertMessage(agentMessage)
                         
                         Log.d(TAG, "Resposta recebida: ${response.response.take(100)}...")
-                        
-                        // Notificar callback
                         onResponseReady?.invoke(response.response)
                     }
                 } else {
                     Log.e(TAG, "Erro ao processar mensagem: ${result?.exceptionOrNull()?.message}")
                     
-                    // Salvar mensagem de erro
                     val errorMessage = Message(
                         senderType = Message.SenderType.SYSTEM,
                         content = "Erro: ${result?.exceptionOrNull()?.message ?: 'Falha na conexão'}",
