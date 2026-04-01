@@ -3,21 +3,21 @@ package com.agente.autonomo.service
 import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.content.SharedPreferences
 import android.os.*
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.agente.autonomo.R
-import com.agente.autonomo.api.MemoryApiClient
 import com.agente.autonomo.data.database.AppDatabase
-import com.agente.autonomo.data.entity.Message
+import com.agente.autonomo.data.entity.AuditLog
 import com.agente.autonomo.data.entity.Task
+import com.agente.autonomo.agent.AgentManager
+import com.agente.autonomo.agent.AgentOrchestrator
+import com.agente.autonomo.utils.AuditLogger
 import kotlinx.coroutines.*
-import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /**
- * Foreground Service principal que mantém o agente rodando
- * e se comunica com o servidor de memória
+ * Foreground Service principal que mantém o agente rodando 24/7
  */
 class AgenteAutonomoService : Service() {
 
@@ -33,24 +33,18 @@ class AgenteAutonomoService : Service() {
         const val EXTRA_MESSAGE = "extra_message"
         const val EXTRA_CONVERSATION_ID = "extra_conversation_id"
         
-        const val PREFS_NAME = "agente_prefs"
-        const val PREF_USER_ID = "user_id"
-        const val PREF_USER_EMAIL = "user_email"
-        const val PREF_API_URL = "api_url"
-        
         @Volatile
         var isRunning = false
             private set
-        
-        var onResponseReady: ((String) -> Unit)? = null
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var database: AppDatabase
-    private lateinit var prefs: SharedPreferences
-    private var memoryClient: MemoryApiClient? = null
-    private var userId: String? = null
+    private lateinit var agentManager: AgentManager
+    private lateinit var agentOrchestrator: AgentOrchestrator
+    private lateinit var auditLogger: AuditLogger
     
+    private var taskProcessorJob: Job? = null
     private var heartbeatJob: Job? = null
 
     override fun onCreate() {
@@ -58,12 +52,9 @@ class AgenteAutonomoService : Service() {
         Log.d(TAG, "Serviço criado")
         
         database = AppDatabase.getDatabase(this)
-        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        
-        userId = prefs.getString(PREF_USER_ID, null)
-        
-        val apiUrl = prefs.getString(PREF_API_URL, MemoryApiClient.DEFAULT_BASE_URL) ?: MemoryApiClient.DEFAULT_BASE_URL
-        memoryClient = MemoryApiClient(apiUrl)
+        auditLogger = AuditLogger(database.auditLogDao())
+        agentManager = AgentManager(database, auditLogger)
+        agentOrchestrator = AgentOrchestrator(database, agentManager, auditLogger)
         
         createNotificationChannel()
     }
@@ -72,8 +63,12 @@ class AgenteAutonomoService : Service() {
         Log.d(TAG, "onStartCommand: ${intent?.action}")
         
         when (intent?.action) {
-            ACTION_START -> startService()
-            ACTION_STOP -> stopService()
+            ACTION_START -> {
+                startService()
+            }
+            ACTION_STOP -> {
+                stopService()
+            }
             ACTION_PROCESS_MESSAGE -> {
                 val message = intent.getStringExtra(EXTRA_MESSAGE)
                 val conversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID) ?: "default"
@@ -83,6 +78,7 @@ class AgenteAutonomoService : Service() {
             }
         }
         
+        // START_STICKY garante que o serviço seja reiniciado se for morto pelo sistema
         return START_STICKY
     }
 
@@ -95,11 +91,12 @@ class AgenteAutonomoService : Service() {
         isRunning = false
         serviceScope.cancel()
         
-        try {
-            val broadcastIntent = Intent(this, RestartService::class.java)
-            sendBroadcast(broadcastIntent)
-        } catch (e: Exception) {
-            Log.e(TAG, "Erro ao enviar broadcast de restart", e)
+        // Enviar broadcast para reiniciar o serviço
+        val broadcastIntent = Intent(this, RestartService::class.java)
+        sendBroadcast(broadcastIntent)
+        
+        serviceScope.launch {
+            auditLogger.logSystem("Serviço destruído, tentando reiniciar...")
         }
     }
 
@@ -111,15 +108,18 @@ class AgenteAutonomoService : Service() {
         
         Log.d(TAG, "Iniciando serviço...")
         
+        // Criar notificação persistente (obrigatório para foreground service)
         val notification = createNotification()
         startForeground(NOTIFICATION_ID, notification)
         
         isRunning = true
         
         serviceScope.launch {
-            ensureUserId()
+            auditLogger.logSystem("Serviço iniciado com sucesso")
         }
         
+        // Iniciar processadores
+        startTaskProcessor()
         startHeartbeat()
         
         Log.d(TAG, "Serviço iniciado com sucesso")
@@ -129,19 +129,43 @@ class AgenteAutonomoService : Service() {
         Log.d(TAG, "Parando serviço...")
         
         isRunning = false
+        taskProcessorJob?.cancel()
         heartbeatJob?.cancel()
+        
+        serviceScope.launch {
+            auditLogger.logSystem("Serviço parado pelo usuário")
+        }
         
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun startTaskProcessor() {
+        taskProcessorJob = serviceScope.launch {
+            while (isActive && isRunning) {
+                try {
+                    processPendingTasks()
+                    delay(TimeUnit.SECONDS.toMillis(5)) // Verifica a cada 5 segundos
+                } catch (e: Exception) {
+                    Log.e(TAG, "Erro no processador de tarefas", e)
+                    auditLogger.logError(
+                        action = "Processar tarefas",
+                        error = e.message ?: "Erro desconhecido"
+                    )
+                    delay(TimeUnit.SECONDS.toMillis(10)) // Espera mais em caso de erro
+                }
+            }
+        }
     }
 
     private fun startHeartbeat() {
         heartbeatJob = serviceScope.launch {
             while (isActive && isRunning) {
                 try {
-                    Log.d(TAG, "Heartbeat: Serviço ativo, userId=$userId")
+                    // Log de heartbeat a cada 5 minutos
+                    auditLogger.logSystem("Heartbeat: Serviço ativo")
                     updateNotification()
-                    delay(300000)
+                    delay(TimeUnit.MINUTES.toMillis(5))
                 } catch (e: Exception) {
                     Log.e(TAG, "Erro no heartbeat", e)
                 }
@@ -149,91 +173,66 @@ class AgenteAutonomoService : Service() {
         }
     }
 
-    private suspend fun ensureUserId() {
-        if (userId != null) return
+    private suspend fun processPendingTasks() {
+        val pendingTasks = database.taskDao().getPendingTasks()
         
-        userId = MemoryApiClient.getCachedUserId()
-        if (userId != null) return
-        
-        userId = prefs.getString(PREF_USER_ID, null)
-        if (userId != null) return
-        
-        val deviceId = UUID.randomUUID().toString().substring(0, 8)
-        val email = "z_user_$deviceId@z-app.local"
-        
-        val result = memoryClient?.getOrCreateUser(email, "Z User")
-        if (result?.isSuccess == true) {
-            val user = result.getOrNull()?.data
-            if (user != null) {
-                userId = user.id
-                prefs.edit()
-                    .putString(PREF_USER_ID, user.id)
-                    .putString(PREF_USER_EMAIL, user.email)
-                    .apply()
-                Log.d(TAG, "Usuário criado: ${user.id}")
+        for (task in pendingTasks) {
+            try {
+                database.taskDao().markTaskAsRunning(task.id)
+                
+                val startTime = System.currentTimeMillis()
+                
+                // Executar a tarefa através do orquestrador
+                val result = agentOrchestrator.executeTask(task)
+                
+                val duration = System.currentTimeMillis() - startTime
+                
+                database.taskDao().markTaskAsCompleted(
+                    task.id,
+                    result = result
+                )
+                
+                auditLogger.logAction(
+                    action = "Tarefa executada: ${task.title}",
+                    agentId = task.assignedAgent,
+                    details = "Tipo: ${task.type}, Duração: ${duration}ms",
+                    durationMs = duration
+                )
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Erro ao executar tarefa ${task.id}", e)
+                
+                val retryCount = task.retryCount + 1
+                if (retryCount >= task.maxRetries) {
+                    database.taskDao().markTaskAsFailed(task.id, e.message ?: "Erro desconhecido")
+                    auditLogger.logError(
+                        action = "Falha na tarefa: ${task.title}",
+                        error = e.message ?: "Erro desconhecido"
+                    )
+                } else {
+                    database.taskDao().incrementRetryCount(task.id)
+                    database.taskDao().updateTaskStatus(task.id, Task.TaskStatus.RETRYING)
+                }
             }
-        } else {
-            Log.e(TAG, "Falha ao criar usuário: ${result?.exceptionOrNull()?.message}")
         }
     }
 
     private fun processMessage(message: String, conversationId: String) {
         serviceScope.launch {
             try {
-                Log.d(TAG, "Processando mensagem: ${message.take(50)}...")
+                auditLogger.logUserAction("Mensagem recebida: ${message.take(100)}...")
                 
-                ensureUserId()
+                // Processar a mensagem através do orquestrador
+                val response = agentOrchestrator.processUserMessage(message, conversationId)
                 
-                val currentUserId = userId
-                if (currentUserId == null) {
-                    Log.e(TAG, "Sem userId, não é possível processar mensagem")
-                    return@launch
-                }
-                
-                val userMessage = Message(
-                    senderType = Message.SenderType.USER,
-                    content = message,
-                    conversationId = conversationId
-                )
-                database.messageDao().insertMessage(userMessage)
-                
-                val result = memoryClient?.sendChatMessage(
-                    currentUserId,
-                    message,
-                    if (conversationId == "default") null else conversationId
-                )
-                
-                if (result?.isSuccess == true) {
-                    val response = result.getOrNull()
-                    if (response != null) {
-                        val agentMessage = Message(
-                            senderType = Message.SenderType.AGENT,
-                            content = response.response,
-                            conversationId = conversationId,
-                            agentId = "z-agent",
-                            agentName = "Z"
-                        )
-                        database.messageDao().insertMessage(agentMessage)
-                        
-                        Log.d(TAG, "Resposta recebida: ${response.response.take(100)}...")
-                        onResponseReady?.invoke(response.response)
-                    }
-                } else {
-                    Log.e(TAG, "Erro ao processar mensagem: ${result?.exceptionOrNull()?.message}")
-                    
-                    val errorMessage = Message(
-                        senderType = Message.SenderType.SYSTEM,
-                        content = "Erro: ${result?.exceptionOrNull()?.message ?: 'Falha na conexão'}",
-                        conversationId = conversationId
-                    )
-                    database.messageDao().insertMessage(errorMessage)
-                    
-                    onResponseReady?.invoke("Erro: ${result?.exceptionOrNull()?.message}")
-                }
+                // A resposta será salva automaticamente pelo orquestrador
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Exceção ao processar mensagem", e)
-                onResponseReady?.invoke("Erro interno: ${e.message}")
+                Log.e(TAG, "Erro ao processar mensagem", e)
+                auditLogger.logError(
+                    action = "Processar mensagem",
+                    error = e.message ?: "Erro desconhecido"
+                )
             }
         }
     }
@@ -243,7 +242,7 @@ class AgenteAutonomoService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 getString(R.string.notification_channel_name),
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_LOW // Baixa importância para não incomodar
             ).apply {
                 description = getString(R.string.notification_channel_description)
                 setShowBadge(false)
@@ -260,17 +259,27 @@ class AgenteAutonomoService : Service() {
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
-            packageManager.getLaunchIntentForPackage(packageName),
+            Intent(this, Class.forName("com.agente.autonomo.ui.activities.MainActivity")),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        
+        val stopIntent = PendingIntent.getService(
+            this,
+            0,
+            Intent(this, AgenteAutonomoService::class.java).apply {
+                action = ACTION_STOP
+            },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_title))
             .setContentText(getString(R.string.notification_text))
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(android.R.drawable.ic_dialog_info) // Ícone padrão
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setSilent(true)
+            .addAction(android.R.drawable.ic_media_pause, getString(R.string.notification_action_stop), stopIntent)
             .build()
     }
 

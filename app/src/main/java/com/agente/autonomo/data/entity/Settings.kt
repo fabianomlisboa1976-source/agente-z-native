@@ -13,22 +13,22 @@ data class Settings(
     @PrimaryKey
     val id: Int = 1, // Sempre 1, apenas uma linha
     
-    // Configurações de API
+    // Configurações de API - Valores padrão otimizados
     @ColumnInfo(name = "api_provider")
     val apiProvider: String = "groq",
     
     @ColumnInfo(name = "api_key")
-    val apiKey: String = "",
+    val apiKey: String = "", // Usuário deve configurar sua própria key
     
     @ColumnInfo(name = "api_model")
-    val apiModel: String = "llama-3.1-8b-instant",
+    val apiModel: String = "llama-3.3-70b-versatile",
     
     @ColumnInfo(name = "api_base_url")
     val apiBaseUrl: String? = null,
     
     // Configurações de geração
     @ColumnInfo(name = "max_tokens")
-    val maxTokens: Int = 2048,
+    val maxTokens: Int = 4096,
     
     @ColumnInfo(name = "temperature")
     val temperature: Float = 0.7f,
@@ -65,7 +65,7 @@ data class Settings(
     
     // Configurações de memória
     @ColumnInfo(name = "context_window_size")
-    val contextWindowSize: Int = 10,
+    val contextWindowSize: Int = 20,
     
     @ColumnInfo(name = "memory_enabled")
     val memoryEnabled: Boolean = true,
@@ -83,4 +83,29 @@ data class Settings(
     
     @ColumnInfo(name = "updated_at")
     val updatedAt: Date = Date()
-)
+) {
+    /**
+     * Retorna true se as configurações básicas estão prontas para uso
+     */
+    fun isConfigured(): Boolean {
+        return apiKey.isNotBlank()
+    }
+    
+    /**
+     * Retorna instruções de configuração
+     */
+    fun getSetupInstructions(): String {
+        return """
+            Para usar o Agente Z, configure sua API Key:
+            
+            1. Acesse https://console.groq.com/keys
+            2. Crie uma chave de API gratuita
+            3. Cole a chave nas Configurações do app
+            
+            Você também pode usar:
+            - OpenRouter (https://openrouter.ai)
+            - Cloudflare Workers AI
+            - Qualquer API compatível com OpenAI
+        """.trimIndent()
+    }
+}
