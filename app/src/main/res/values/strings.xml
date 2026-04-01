@@ -34,6 +34,10 @@
     <string name="setting_auto_start">Iniciar Automaticamente</string>
     <string name="setting_notifications">Notificações</string>
     <string name="setting_audit_enabled">Auditoria Ativada</string>
+    <string name="setting_multi_agent">Multi-Agentes Ativado</string>
+    <string name="setting_cross_audit">Auditoria Cruzada</string>
+    <string name="setting_memory">Memória Persistente</string>
+    <string name="setting_context_window">Janela de Contexto</string>
     
     <!-- Provedores de API -->
     <string name="provider_groq">Groq (Recomendado)</string>

@@ -12,7 +12,8 @@
         android:layout_height="wrap_content"
         android:orientation="vertical"
         android:background="@color/message_system_background"
-        android:padding="8dp 16dp">
+        android:paddingVertical="8dp"
+        android:paddingHorizontal="16dp">
 
         <TextView
             android:id="@+id/tvMessageContent"
