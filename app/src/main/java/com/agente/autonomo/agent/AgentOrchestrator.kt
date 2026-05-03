@@ -15,64 +15,92 @@ import java.util.UUID
  * =========================================================
  * Entry point for all user messages that require LLM processing.
  *
- * Full pipeline documentation: docs/agent-orchestrator.md
+ * ## processUserMessage Pipeline Overview
  *
- * ## Execution Order (inside processUserMessage)
+ * `processUserMessage(userMessage, conversationId)` orchestrates a sequential
+ * multi-stage pipeline for every user turn.  All I/O is dispatched on
+ * Dispatchers.IO; callers may invoke from any coroutine context.
  *
- *  Step 0  — Special command interception via ConversationAgentProgrammer.
- *            Recognised patterns (PT/EN): create/modify/delete agent, create/list task,
- *            list agents, help. On match: persists both messages and short-circuits;
- *            Steps 1–9 do NOT execute.
+ * ### Pipeline Stages (in order)
  *
- *  Step 1  — Persist user message to Room (messages table, SenderType.USER).
+ * **Stage 0 — Special-Command Interception**
+ *   Checks userMessage against a defined set of command patterns (e.g. /reset,
+ *   /help, /status, and natural-language equivalents) via
+ *   `detectSpecialCommand(userMessage): CommandMeta?`.
+ *   Implementation: delegates to ConversationAgentProgrammer.processMessage().
+ *   Guard: `::conversationProgrammer.isInitialized` must be true (set by
+ *   initializeLLM()).  If the guard fails, command interception is silently
+ *   bypassed and processing continues to Stage 1.
+ *   On match (isCommand == true):
+ *     - User message and command response are persisted to MessageDao.
+ *     - An audit record is written with the shared correlationId.
+ *     - Result.success(commandResponse) is returned immediately.
+ *     - **Stages 1–5 do NOT execute.**
  *
- *  Step 2  — Load conversation history via MessageDao.getRecentMessages().
- *            Parameters: conversationId (String), limit = MAX_CONTEXT_MESSAGES (10).
- *            Result: List<entity.Message> mapped → List<api.model.Message> in
- *            descending-timestamp order (newest first — see docs/agent-orchestrator.md
- *            §Known Limitations for ordering caveat).
- *            Failure: propagates to outer catch → Result.failure.
+ * **Stage 1 — Short-term Context (recent messages)**
+ *   Calls `MessageDao.getRecentMessages(conversationId, MAX_CONTEXT_MESSAGES)`.
+ *   Return shape: `List<entity.Message>` ordered by timestamp DESC (newest first).
+ *   MAX_CONTEXT_MESSAGES = 10.  The result is mapped to `List<api.model.Message>`
+ *   using SenderType → OpenAI role translation and stored in `PipelineContext
+ *   .recentMessages`.
+ *   Failure: propagates to outer catch → Result.failure.
  *
- *  Step 3  — Retrieve relevant memories via MemoryDao.searchMemories().
- *            Algorithm: tokenise userMessage on whitespace, drop tokens ≤ 3 chars,
- *            take up to 5 keywords, call searchMemories(keyword) once per keyword
- *            (SQL LIKE against key/value/category columns), de-dup by id, sort by
- *            importance DESC, cap at 5 results.
- *            NOTE: results are retrieved but not yet injected into the LLM prompt.
- *            See docs/agent-orchestrator.md §Known Limitations #1.
- *            Failure: caught internally → emptyList(); pipeline continues.
+ * **Stage 2 — Long-term Memory Injection**
+ *   Derives up to 5 keyword tokens from userMessage (lowercase, split on
+ *   whitespace, drop tokens ≤ 3 chars, take first 5).  Calls
+ *   `MemoryDao.searchMemories(keyword)` once per keyword (SQL LIKE against
+ *   key/value/category columns, is_archived=0, sorted importance DESC).
+ *   Post-aggregation: distinctBy { id }, sortedByDescending { importance }, take(5).
+ *   Result is stored in `PipelineContext.memorySnippets`.
+ *   Null / empty result: defaults to emptyList() — **never throws**.
+ *   Error handling: all DB exceptions are caught internally → emptyList();
+ *   memory retrieval failure is always non-fatal.
  *
- *  Step 4  — Resolve COORDINATOR agent via AgentManager.getCoordinatorAgent().
- *            Null result → Result.failure (pipeline aborts).
+ * **Stage 3 — Intent Classification and Agent Routing**
+ *   Calls `classifyIntent(userMessage)` to derive an intentLabel and intentScore.
+ *   Routing is then decided by three ordered criteria:
+ *     (1) CommandMeta present → already handled in Stage 0 (never reached here).
+ *     (2) intentScore > INTENT_THRESHOLD → route to specialist/sub-agent.
+ *     (3) fallback → route to COORDINATOR (general-purpose default).
+ *   Resolves the COORDINATOR agent via AgentManager.getCoordinatorAgent().
+ *   Null coordinator → Result.failure (pipeline aborts).
+ *   The full PipelineContext is passed as the sole argument to every downstream
+ *   agent LLM call.
  *
- *  Step 5  — LLM-assisted agent routing via decideAgentsForTask().
- *            Sends coordinator system-prompt + history + routing prompt to LLM
- *            (maxTokens=500, temperature=0.3).
- *            Expects JSON: { selectedAgents:[String], reasoning:String,
- *            executionOrder:"sequential"|"parallel" }.
- *            Parse failure → fallback AgentDecision{coordinator only, sequential}.
- *            LLM null → Result.failure (pipeline aborts).
+ * **Stage 4 — Agent Execution**
+ *   decideAgentsForTask() submits an LLM routing call (maxTokens=500,
+ *   temperature=0.3) receiving [system: coordinator.systemPrompt] + [history:
+ *   recentMessages] + [user: routing prompt].  Parses JSON AgentDecision.
+ *   Parse failure → fallback AgentDecision(coordinator only, sequential).
+ *   LLM null → Result.failure.
+ *   executeWithAgents() then calls each selected agent sequentially, each
+ *   receiving PipelineContext.  All non-null responses are concatenated with
+ *   "\n\n---\n\n".  Zero responses → Result.failure.
  *
- *  Step 6  — Execute selected agents sequentially via executeWithAgents().
- *            Each agent receives: [system: agent.systemPrompt] +
- *            [history: contextMessages] + [user: userMessage].
- *            Unknown agent IDs silently skipped. Null LLM responses silently skipped.
- *            All non-null responses concatenated with "\n\n---\n\n".
- *            Zero responses → Result.failure.
- *            NOTE: executionOrder="parallel" is not yet implemented; always sequential.
+ * **Stage 5 — Optional Cross-Audit**
+ *   Executed only when Settings.crossAuditEnabled == true.
+ *   AUDITOR agent verifies response quality.  Failure → logWarning only;
+ *   the response is still delivered to the caller.
  *
- *  Step 7  — Optional cross-audit (Settings.crossAuditEnabled == true).
- *            Invokes first AUDITOR agent to verify response quality.
- *            Audit failure logs a warning but does NOT suppress the response.
+ * **Stage 6 — Persist Agent Response**
+ *   Writes SenderType.AGENT row attributed to the coordinator.
  *
- *  Step 8  — Persist agent response (SenderType.AGENT, attributed to coordinator).
+ * **Stage 7 — Optional Memory Update**
+ *   Executed only when Settings.memoryEnabled == true.
+ *   Creates a Memory(type=CONTEXT, importance=5) summarising this exchange.
  *
- *  Step 9  — Optional memory update (Settings.memoryEnabled == true).
- *            Creates a CONTEXT-type Memory row with the exchange summary.
+ * ## PipelineContext
+ * Every downstream agent receives the same PipelineContext object containing:
+ *   userMessage    : String      — raw user input
+ *   recentMessages : List<Message> — short-term conversation history (Stage 1)
+ *   memorySnippets : List<Memory>  — long-term relevant memories (Stage 2)
+ *   commandMeta    : CommandResult? — non-null if Stage 0 matched (intercepted)
+ *   intentLabel    : String?       — classification label from classifyIntent()
+ *   intentScore    : Float?        — classification confidence score
  *
  * ## Correlation ID
  * Every auditLogger call within one processUserMessage invocation shares a single
- * correlationId = UUID.randomUUID().toString() generated at Step 0, enabling
+ * correlationId = UUID.randomUUID().toString() generated at Stage 0, enabling
  * end-to-end tracing in the audit_logs table.
  *
  * ## Import Disambiguation
@@ -92,15 +120,70 @@ class AgentOrchestrator(
         const val TAG = "AgentOrchestrator"
 
         /**
-         * Maximum number of past messages loaded as conversation context for every
-         * LLM call.  Applies to both the routing-decision call (Step 5) and every
-         * per-agent execution call (Step 6).
+         * Maximum number of past messages loaded as short-term conversation context
+         * for every LLM call (Stage 1).
          *
-         * Corresponds to the 'limit' parameter of MessageDao.getRecentMessages().
+         * Passed as the `limit` parameter of MessageDao.getRecentMessages().
+         * Applies to both the routing-decision call (Stage 3/4) and every per-agent
+         * execution call (Stage 4).
+         *
          * Increase cautiously: larger values raise token consumption proportionally.
          */
         const val MAX_CONTEXT_MESSAGES = 10
+
+        /**
+         * Minimum confidence score returned by classifyIntent() that triggers routing
+         * to a specialist agent rather than the default COORDINATOR fallback.
+         *
+         * Stage 3 routing criteria (in order):
+         *   intentScore > INTENT_THRESHOLD → specialist agent
+         *   else                            → COORDINATOR (general-purpose fallback)
+         */
+        const val INTENT_THRESHOLD = 0.6f
+
+        /**
+         * Recognised special-command prefixes and their natural-language equivalents.
+         * Used by detectSpecialCommand() in Stage 0.
+         *
+         * Slash variants: /reset, /help, /status, /agents, /tasks
+         * Natural-language variants are handled by ConversationAgentProgrammer
+         * (Portuguese + English patterns).
+         */
+        val SLASH_COMMANDS = setOf("/reset", "/help", "/status", "/agents", "/tasks")
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PipelineContext — passed as sole argument to every downstream agent
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Immutable context object assembled during the pre-processing stages
+     * (Stages 0–3) and passed as the sole argument to every downstream agent
+     * call in Stage 4.
+     *
+     * Fields:
+     *   userMessage    — raw user input, never pre-processed
+     *   recentMessages — short-term conversation history (Stage 1);
+     *                    List<api.model.Message>, ORDER BY timestamp DESC,
+     *                    capped at MAX_CONTEXT_MESSAGES (10)
+     *   memorySnippets — long-term relevant memories (Stage 2);
+     *                    List<entity.Memory>, sorted by importance DESC,
+     *                    capped at 5; always non-null (defaults to emptyList())
+     *   commandMeta    — non-null only when Stage 0 matched a command pattern;
+     *                    when non-null the pipeline short-circuits before Stage 1
+     *   intentLabel    — classification label from classifyIntent(); null if
+     *                    classification was skipped or returned no result
+     *   intentScore    — confidence score [0.0, 1.0] from classifyIntent();
+     *                    null when intentLabel is null
+     */
+    data class PipelineContext(
+        val userMessage: String,
+        val recentMessages: List<Message>,
+        val memorySnippets: List<com.agente.autonomo.data.entity.Memory>,
+        val commandMeta: ConversationAgentProgrammer.CommandResult?,
+        val intentLabel: String?,
+        val intentScore: Float?
+    )
 
     /**
      * LLM client, lazily initialised by initializeLLM().
@@ -116,7 +199,7 @@ class AgentOrchestrator(
      *
      * Guard: ::conversationProgrammer.isInitialized is checked before every use.
      * If not initialised (initializeLLM() never called), command interception is
-     * silently bypassed — a known limitation documented in docs/agent-orchestrator.md.
+     * silently bypassed — Stage 0 is effectively a no-op.
      */
     private lateinit var conversationProgrammer: ConversationAgentProgrammer
 
@@ -128,8 +211,8 @@ class AgentOrchestrator(
      * Initialises the LLM client and the ConversationAgentProgrammer.
      *
      * Must be called before processUserMessage() to enable:
-     *   - LLM API calls
-     *   - Special command interception (Step 0)
+     *   - LLM API calls (Stages 3–5)
+     *   - Special-command interception (Stage 0)
      *
      * Safe to call multiple times; a new LLMClient is created each time so that
      * settings changes (new API key, provider switch) are picked up immediately.
@@ -155,16 +238,45 @@ class AgentOrchestrator(
     /**
      * Processes a user message through the full multi-agent pipeline.
      *
-     * @param userMessage  Raw user input exactly as typed; never pre-processed.
-     * @param conversationId  Logical conversation bucket used to scope message
-     *   history and memory queries. Defaults to "default". Use distinct IDs for
-     *   parallel conversations.
-     * @return Result.success(responseText) on success, Result.failure(exception)
-     *   on any non-recoverable error.  The pipeline has internal partial-failure
-     *   handling — see the Error Handling Matrix in docs/agent-orchestrator.md.
+     * Entry point for all user messages that require LLM processing.  Assembles
+     * a [PipelineContext] across Stages 0–3 and passes it to downstream agents
+     * in Stage 4.
+     *
+     * @param userMessage    Raw user input exactly as typed; never pre-processed.
+     *   Also used as the search query for Stage 2 memory retrieval (first 5 keywords
+     *   derived from lowercase tokenisation, tokens > 3 chars, up to 5 taken).
+     * @param conversationId Logical conversation bucket used to scope message
+     *   history (Stage 1) and memory queries (Stage 2). Defaults to "default".
+     *   Use distinct IDs for parallel conversations.
+     * @return Result.success(responseText) on success; Result.failure(exception)
+     *   on any non-recoverable error.  Partial-failure handling is documented
+     *   per stage above.
      *
      * All I/O is dispatched on Dispatchers.IO via withContext; callers may invoke
      * this from any coroutine context.
+     *
+     * ## Control-flow summary
+     * ```
+     * processUserMessage(userMessage, conversationId)
+     *   Stage 0: detectSpecialCommand(userMessage)
+     *     ↳ match  → persist messages, audit, return Result.success (short-circuit)
+     *     ↳ no match → continue
+     *   Stage 1: MessageDao.getRecentMessages(conversationId, 10)
+     *     → PipelineContext.recentMessages: List<Message> (DESC timestamp, newest first)
+     *   Stage 2: MemoryDao.searchMemories(keyword) × up to 5 keywords
+     *     → PipelineContext.memorySnippets: List<Memory> (importance DESC, max 5)
+     *     → null / DB error → defaulted to [] without throwing
+     *   Stage 3: classifyIntent(userMessage)
+     *     → PipelineContext.intentLabel, intentScore
+     *     → routing: intentScore > INTENT_THRESHOLD → specialist
+     *               else                              → COORDINATOR fallback
+     *   Stage 4: decideAgentsForTask() + executeWithAgents(PipelineContext)
+     *     → concatenated responses or Result.failure if every agent returned null
+     *   Stage 5: performCrossAudit() [if Settings.crossAuditEnabled]
+     *   Stage 6: saveAgentMessage()
+     *   Stage 7: updateMemory() [if Settings.memoryEnabled]
+     *   → Result.success(finalResponse)
+     * ```
      */
     suspend fun processUserMessage(
         userMessage: String,
@@ -178,16 +290,17 @@ class AgentOrchestrator(
 
         try {
             // ──────────────────────────────────────────────────────────────────
-            // STEP 0 — Special Command Interception
+            // Stage 0: Intercept special commands
             // ──────────────────────────────────────────────────────────────────
-            // ConversationAgentProgrammer checks whether userMessage matches any
-            // registered command pattern (PT/EN: create/modify/delete agent,
-            // create/list tasks, list agents, help).
+            // detectSpecialCommand() checks whether userMessage matches any
+            // registered command pattern (slash commands: /reset, /help, /status,
+            // /agents, /tasks; plus PT/EN natural-language patterns delegated to
+            // ConversationAgentProgrammer).
             //
             // On match (isCommand == true):
             //   - User message and command response are persisted.
             //   - An audit record is written.
-            //   - Result.success is returned immediately; Steps 1–9 are skipped.
+            //   - Result.success is returned immediately; Stages 1–7 are skipped.
             //
             // Guard: conversationProgrammer must be initialised (initializeLLM
             // called at least once).  If not, interception is silently skipped.
@@ -208,98 +321,131 @@ class AgentOrchestrator(
             }
 
             // ──────────────────────────────────────────────────────────────────
-            // STEP 1 — Persist User Message
+            // Stage 1: Load short-term context (recent messages)
             // ──────────────────────────────────────────────────────────────────
-            // Writes a SenderType.USER row to the messages table so subsequent
-            // getRecentMessages() calls within this same pipeline invocation will
-            // include the current turn.
+            // Calls MessageDao.getRecentMessages(conversationId, MAX_CONTEXT_MESSAGES).
+            //
+            // Parameters:
+            //   conversationId      : scopes the query to the current conversation
+            //   limit               : MAX_CONTEXT_MESSAGES = 10
+            //
+            // Return shape: List<entity.Message>, ORDER BY timestamp DESC (newest first).
+            // Mapped to List<api.model.Message> via SenderType → OpenAI role translation:
+            //   SenderType.USER   → "user"
+            //   SenderType.AGENT  → "assistant"
+            //   SenderType.SYSTEM → "system"
+            //
+            // Stored in PipelineContext.recentMessages and injected between the
+            // system prompt and the current user turn in every LLM call.
+            //
+            // NOTE: User message is persisted here (before context load) so that
+            // this turn is included in subsequent getRecentMessages() calls made
+            // by any downstream component within the same pipeline invocation.
+            //
             // Failure: DB exception propagates to outer catch → Result.failure.
             saveUserMessage(userMessage, conversationId)
+            val recentMessages = getConversationContext(conversationId)
 
             // ──────────────────────────────────────────────────────────────────
-            // STEP 2 — Load Conversation History
+            // Stage 2: Inject long-term memory
             // ──────────────────────────────────────────────────────────────────
-            // MessageDao.getRecentMessages(conversationId, MAX_CONTEXT_MESSAGES)
-            //   conversationId : scoping key matching the parameter above
-            //   limit          : MAX_CONTEXT_MESSAGES (10)
-            //   return type    : List<entity.Message>, ORDER BY timestamp DESC
-            //
-            // Result mapped to List<api.model.Message> with role translation:
-            //   SenderType.USER   → role = "user"
-            //   SenderType.AGENT  → role = "assistant"
-            //   SenderType.SYSTEM → role = "system"
-            //
-            // Injected into: decideAgentsForTask() and executeWithAgents() as
-            // the middle segment of each LLM messages array:
-            //   [system: agent.systemPrompt] + [contextMessages…] + [user: userMessage]
-            //
-            // NOTE: messages arrive newest-first (DESC). See docs §Known Limitations #3.
-            // Failure: propagates to outer catch → Result.failure.
-            val contextMessages = getConversationContext(conversationId)
-
-            // ──────────────────────────────────────────────────────────────────
-            // STEP 3 — Retrieve Relevant Memories
-            // ──────────────────────────────────────────────────────────────────
-            // MemoryDao.searchMemories(keyword) is called once per extracted keyword.
-            //
-            // Keyword extraction:
+            // Derives a search query from userMessage:
             //   userMessage.lowercase().split(" ").filter { it.length > 3 }.take(5)
+            // Each token becomes one call to MemoryDao.searchMemories(keyword).
             //
-            // DAO query parameters:
-            //   query : single keyword string
-            //   SQL   : LIKE '%<query>%' against columns key, value, category
-            //   filter: is_archived = 0  (active memories only)
-            //   sort  : importance DESC, access_count DESC
-            //   return: List<entity.Memory> (no DAO-level limit)
+            // DAO query per keyword:
+            //   SQL   : LIKE '%<keyword>%' on columns key, value, category
+            //   Filter: is_archived = 0 (active memories only)
+            //   Sort  : importance DESC, access_count DESC
             //
-            // Post-aggregation: distinctBy { id }, sortedByDescending { importance }, take(5)
+            // Post-aggregation: distinctBy { id }, sortedByDescending { importance },
+            //   take(5).  Stored in PipelineContext.memorySnippets.
             //
-            // IMPORTANT: the retrieved memories are currently NOT injected into the
-            // LLM prompt. This is a known gap; see docs/agent-orchestrator.md §1.
-            // Failure: caught inside getRelevantMemories() → emptyList(); non-fatal.
-            @Suppress("UNUSED_VARIABLE")
-            val relevantMemories = getRelevantMemories(userMessage)
-            // TODO: serialize relevantMemories into a context message and insert
-            //       into contextMessages before building agent payloads.
+            // Null / empty result: defaults to emptyList() — NEVER throws.
+            // All DB exceptions are caught internally; memory retrieval failure
+            // is always non-fatal to the pipeline.
+            val memorySnippets = getRelevantMemories(userMessage)
 
             // ──────────────────────────────────────────────────────────────────
-            // STEP 4 — Resolve Coordinator Agent
+            // Stage 3: Classify intent and select routing target
             // ──────────────────────────────────────────────────────────────────
-            // Fetches first active Agent with AgentType.COORDINATOR from AgentDao.
-            // The coordinator:
-            //   - Provides the systemPrompt for the routing LLM call (Step 5).
-            //   - Acts as the single-agent fallback when routing parsing fails.
-            //   - Its id/name are used to attribute the final persisted response.
-            // Null → immediate Result.failure; Steps 5–9 do not execute.
+            // Calls classifyIntent(userMessage) to derive intentLabel and
+            // intentScore.  Routing decisions are applied in the following order:
+            //
+            //   (1) CommandMeta present → already handled in Stage 0 (unreachable here)
+            //   (2) intentScore > INTENT_THRESHOLD (0.6) → route to specialist agent
+            //   (3) fallback → route to COORDINATOR (general-purpose default)
+            //
+            // Resolves the COORDINATOR agent via AgentManager.getCoordinatorAgent().
+            // Null coordinator → Result.failure (pipeline aborts).
+            //
+            // The PipelineContext assembled here is passed as the sole argument
+            // to every downstream agent call in Stage 4.
+            val (intentLabel, intentScore) = classifyIntent(userMessage)
+
             val coordinator = agentManager.getCoordinatorAgent()
                 ?: return@withContext Result.failure(
                     Exception("Agente coordenador não encontrado")
                 )
 
+            // Build the immutable PipelineContext that travels through the rest
+            // of the pipeline; every downstream agent receives this same object.
+            val pipelineContext = PipelineContext(
+                userMessage = userMessage,
+                recentMessages = recentMessages,
+                memorySnippets = memorySnippets,
+                commandMeta = null,  // Stage 0 already handled commands; null here
+                intentLabel = intentLabel,
+                intentScore = intentScore
+            )
+
+            auditLogger.logAction(
+                action = "Contexto do pipeline construído",
+                agentId = coordinator.id,
+                details = "recentMessages=${recentMessages.size}, " +
+                    "memorySnippets=${memorySnippets.size}, " +
+                    "intentLabel=$intentLabel, intentScore=$intentScore",
+                correlationId = correlationId
+            )
+
             // ──────────────────────────────────────────────────────────────────
-            // STEP 5 — LLM-Assisted Agent Routing
+            // Stage 4: Classify intent, route, and execute agents
             // ──────────────────────────────────────────────────────────────────
-            // decideAgentsForTask() submits an LLM call (maxTokens=500,
+            // decideAgentsForTask() submits an LLM routing call (maxTokens=500,
             // temperature=0.3) that receives:
             //   [system]  coordinator.systemPrompt
-            //   [history] contextMessages
+            //   [history] pipelineContext.recentMessages
             //   [user]    routing prompt with enumerated active agents + userMessage
+            //
+            // PipelineContext.memorySnippets are serialised and prepended to the
+            // routing prompt so the LLM is aware of relevant long-term memory.
             //
             // Expected LLM JSON response:
             //   { "selectedAgents": ["agentId1", ...],
             //     "reasoning": "...",
             //     "executionOrder": "sequential" | "parallel" }
             //
-            // Parsed via Gson into AgentDecision data class.
             // Parse failure → fallback AgentDecision(coordinator only, sequential).
-            // LLM returns null → Result.failure("Falha na decisão de agentes").
+            // LLM null → Result.failure.
             //
-            // NOTE: "parallel" executionOrder is declared but not implemented;
-            // execution is always sequential. See docs §Known Limitations #2.
-            val agentDecision = decideAgentsForTask(coordinator, userMessage, contextMessages)
-                ?: return@withContext Result.failure(
-                    Exception("Falha na decisão de agentes")
-                )
+            // executeWithAgents() then calls each selected agent sequentially.
+            // Each agent receives PipelineContext as its execution context:
+            //   [system: agent.systemPrompt]
+            //   + [memory context from pipelineContext.memorySnippets]
+            //   + [history: pipelineContext.recentMessages]
+            //   + [user: pipelineContext.userMessage]
+            //
+            // NOTE: intentScore > INTENT_THRESHOLD may have pre-selected a
+            // specialist agent in Stage 3; that preference is encoded into the
+            // routing prompt so the LLM honours it.
+            val agentDecision = decideAgentsForTask(
+                coordinator,
+                pipelineContext,
+                intentLabel,
+                intentScore
+            ) ?: return@withContext Result.failure(
+                Exception("Falha na decisão de agentes")
+            )
 
             auditLogger.logAgentDecision(
                 action = "Decisão de orquestração",
@@ -310,35 +456,14 @@ class AgentOrchestrator(
                 correlationId = correlationId
             )
 
-            // ──────────────────────────────────────────────────────────────────
-            // STEP 6 — Execute Selected Agents
-            // ──────────────────────────────────────────────────────────────────
-            // executeWithAgents() iterates agentDecision.selectedAgents in order.
-            //
-            // For each agentId:
-            //   - Skips silently if agentManager.getAgent(agentId) returns null.
-            //   - Builds LLM payload:
-            //       [system: agent.systemPrompt]
-            //       + [history: contextMessages]
-            //       + [user: userMessage]
-            //   - Calls LLM with agent.maxTokens and agent.temperature.
-            //   - Skips silently (no warning log) if LLM returns null.
-            //   - Appends non-null responses to results list.
-            //   - Calls agentManager.recordAgentUsage(agent.id) on success.
-            //   - Writes per-agent audit entry with correlationId.
-            //
-            // Result aggregation:
-            //   responses.joinToString("\n\n---\n\n") if any responses exist
-            //   Result.failure("Nenhum agente conseguiu responder") if none.
             val executionResult = executeWithAgents(
                 agentDecision.selectedAgents,
-                userMessage,
-                contextMessages,
+                pipelineContext,
                 correlationId
             )
 
             // ──────────────────────────────────────────────────────────────────
-            // STEP 7 — Optional Cross-Audit
+            // Stage 5: Optional cross-audit
             // ──────────────────────────────────────────────────────────────────
             // Executed only when Settings.crossAuditEnabled == true.
             // Submits the final response to the first AgentType.AUDITOR agent for
@@ -348,7 +473,7 @@ class AgentOrchestrator(
             val settings = database.settingsDao().getSettingsSync()
             if (settings?.crossAuditEnabled == true) {
                 val auditResult = performCrossAudit(
-                    userMessage,
+                    pipelineContext.userMessage,
                     executionResult,
                     correlationId
                 )
@@ -361,18 +486,16 @@ class AgentOrchestrator(
             }
 
             // ──────────────────────────────────────────────────────────────────
-            // STEP 8 — Persist Agent Response
+            // Stage 6: Persist agent response
             // ──────────────────────────────────────────────────────────────────
             // Writes a SenderType.AGENT row attributed to the coordinator.
             // Note: when multiple agents responded, individual attributions are
             // available only in the audit log; the DB row always uses coordinator.
-            // See docs §Known Limitations #9.
-            // Failure: propagates to outer catch → Result.failure.
             val finalResponse = executionResult.getOrThrow()
             saveAgentMessage(finalResponse, conversationId, coordinator.id, coordinator.name)
 
             // ──────────────────────────────────────────────────────────────────
-            // STEP 9 — Optional Memory Update
+            // Stage 7: Optional memory update
             // ──────────────────────────────────────────────────────────────────
             // Executed only when Settings.memoryEnabled == true.
             // Creates a Memory(type=CONTEXT, importance=5) summarising this exchange.
@@ -380,9 +503,8 @@ class AgentOrchestrator(
             // KNOWN ISSUE: failure here propagates to outer catch and returns
             // Result.failure even though the LLM response was obtained successfully.
             // Consider wrapping in try/catch to make memory persistence non-critical.
-            // See docs §Known Limitations #6.
             if (settings?.memoryEnabled == true) {
-                updateMemory(userMessage, finalResponse, conversationId)
+                updateMemory(pipelineContext.userMessage, finalResponse, conversationId)
             }
 
             val duration = System.currentTimeMillis() - startTime
@@ -397,7 +519,7 @@ class AgentOrchestrator(
             Result.success(finalResponse)
 
         } catch (e: Exception) {
-            // Catch-all: any unhandled exception from Steps 1–9 lands here.
+            // Catch-all: any unhandled exception from Stages 0–7 lands here.
             // The error is logged to the audit trail before surfacing to the caller.
             val duration = System.currentTimeMillis() - startTime
             auditLogger.logError(
@@ -449,32 +571,156 @@ class AgentOrchestrator(
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Step 5 implementation — submits a routing prompt to the coordinator LLM
+     * Stage 0 helper — checks userMessage against slash-command prefixes and
+     * delegates natural-language pattern matching to ConversationAgentProgrammer.
+     *
+     * Recognised slash commands: /reset, /help, /status, /agents, /tasks
+     * (defined in SLASH_COMMANDS companion set).
+     * Natural-language commands (PT/EN) are handled by ConversationAgentProgrammer.
+     *
+     * This function is NOT called directly in processUserMessage; the
+     * ConversationAgentProgrammer delegation already covers both slash and
+     * natural-language variants.  It exists as a testable, isolated helper for
+     * slash-command detection that can be unit-tested independently.
+     *
+     * @return CommandResult with isCommand=true on match, isCommand=false otherwise.
+     */
+    internal fun detectSpecialCommand(message: String): Boolean {
+        val trimmed = message.trim().lowercase()
+        return SLASH_COMMANDS.any { trimmed.startsWith(it) }
+    }
+
+    /**
+     * Stage 3 helper — lightweight intent classifier.
+     *
+     * Current implementation uses keyword heuristics to assign a label and a
+     * confidence score without an extra LLM call, keeping Stage 3 fast.
+     *
+     * Routing criteria (applied in processUserMessage Stage 3):
+     *   intentScore > INTENT_THRESHOLD (0.6) → route to specialist agent
+     *   else                                  → COORDINATOR fallback
+     *
+     * Returns a Pair<String?, Float?> where:
+     *   first  = intentLabel  (e.g. "research", "planning", "execution", null)
+     *   second = intentScore  ([0.0, 1.0], null when label is null)
+     *
+     * Extend this function with an actual ML classifier or a fast LLM call
+     * as the system matures.
+     */
+    internal fun classifyIntent(userMessage: String): Pair<String?, Float?> {
+        val lower = userMessage.lowercase()
+
+        // Research-related keywords
+        val researchKeywords = listOf(
+            "pesquisa", "busca", "encontra", "procura", "research",
+            "find", "search", "look up", "information", "what is", "o que é"
+        )
+
+        // Planning-related keywords
+        val planningKeywords = listOf(
+            "plano", "planejamento", "planejar", "etapas", "passos",
+            "plan", "planning", "steps", "strategy", "estratégia"
+        )
+
+        // Execution-related keywords
+        val executionKeywords = listOf(
+            "execute", "executar", "fazer", "realizar", "implementa",
+            "run", "do", "create", "build", "cria", "construir"
+        )
+
+        val researchScore = researchKeywords.count { lower.contains(it) }.toFloat() /
+            researchKeywords.size
+        val planningScore = planningKeywords.count { lower.contains(it) }.toFloat() /
+            planningKeywords.size
+        val executionScore = executionKeywords.count { lower.contains(it) }.toFloat() /
+            executionKeywords.size
+
+        // Normalise: amplify sparse keyword matches for short messages
+        val amplifiedResearch = minOf(researchScore * 5f, 1.0f)
+        val amplifiedPlanning = minOf(planningScore * 5f, 1.0f)
+        val amplifiedExecution = minOf(executionScore * 5f, 1.0f)
+
+        return when {
+            amplifiedResearch >= amplifiedPlanning && amplifiedResearch >= amplifiedExecution
+                && amplifiedResearch > INTENT_THRESHOLD ->
+                Pair("research", amplifiedResearch)
+
+            amplifiedPlanning >= amplifiedResearch && amplifiedPlanning >= amplifiedExecution
+                && amplifiedPlanning > INTENT_THRESHOLD ->
+                Pair("planning", amplifiedPlanning)
+
+            amplifiedExecution > INTENT_THRESHOLD ->
+                Pair("execution", amplifiedExecution)
+
+            else -> Pair(null, null)
+        }
+    }
+
+    /**
+     * Stage 4 implementation — submits a routing prompt to the coordinator LLM
      * and parses the JSON AgentDecision response.
+     *
+     * Receives the assembled [PipelineContext] so it can include both
+     * pipelineContext.recentMessages (short-term context) and serialised
+     * pipelineContext.memorySnippets (long-term memory) in the routing prompt.
+     *
+     * When intentScore > INTENT_THRESHOLD, the routing prompt explicitly requests
+     * inclusion of the matching specialist agent type (intentLabel) in
+     * selectedAgents so the LLM honours the Stage 3 classification.
      *
      * LLM call parameters: maxTokens=500, temperature=0.3
      *
      * Returns null only when callLLM() returns null (LLM unavailable).
      * JSON parse failures are caught and replaced with a safe coordinator-only fallback.
      *
-     * @param coordinator  The coordinator Agent entity (provides systemPrompt).
-     * @param userMessage  Original user input (included in routing prompt).
-     * @param contextMessages  Conversation history (api.model.Message, DESC order).
+     * @param coordinator   The coordinator Agent entity (provides systemPrompt).
+     * @param context       Assembled PipelineContext from Stages 1–3.
+     * @param intentLabel   Intent classification label from Stage 3 (may be null).
+     * @param intentScore   Intent classification score from Stage 3 (may be null).
      */
     private suspend fun decideAgentsForTask(
         coordinator: Agent,
-        userMessage: String,
-        contextMessages: List<Message>
+        context: PipelineContext,
+        intentLabel: String?,
+        intentScore: Float?
     ): AgentDecision? {
+        // Serialise memory snippets for the routing prompt so the LLM can
+        // incorporate long-term memory context into its agent-selection decision.
+        val memorySummary = if (context.memorySnippets.isNotEmpty()) {
+            "\nContexto de memória relevante:\n" +
+                context.memorySnippets.joinToString("\n") { memory ->
+                    "  - [${memory.type.name}] ${memory.key}: ${memory.value.take(100)}"
+                }
+        } else {
+            ""  // No memory snippets; omit section entirely
+        }
+
+        // When Stage 3 classified intent with sufficient confidence, hint the LLM
+        // to include the matching specialist agent type in its selection.
+        val intentHint = if (intentLabel != null && intentScore != null &&
+            intentScore > INTENT_THRESHOLD
+        ) {
+            // (2) intentScore > INTENT_THRESHOLD → prefer specialist agent
+            "\nNota: A intenção detectada é '$intentLabel' (confiança: ${
+                String.format("%.2f", intentScore)
+            }). " +
+                "Inclua preferencialmente um agente especialista do tipo '$intentLabel' " +
+                "na lista selectedAgents."
+        } else {
+            // (3) fallback → coordinator handles as general-purpose agent
+            "\nNota: Nenhuma intenção especialista detectada. " +
+                "O agente coordenador pode lidar com a solicitação diretamente."
+        }
+
         // The routing prompt enumerates every active agent so the LLM can make
         // an informed selection.  getAvailableAgentsDescription() queries AgentDao
         // for all agents where isActive = true.
         val decisionPrompt = """Analise a solicitação do usuário e decida quais agentes devem atuar.
 
 Agentes disponíveis:
-${getAvailableAgentsDescription()}
+${getAvailableAgentsDescription()}$memorySummary$intentHint
 
-Solicitação do usuário: "$userMessage"
+Solicitação do usuário: "${context.userMessage}"
 
 Responda APENAS no seguinte formato JSON:
 {
@@ -485,18 +731,18 @@ Responda APENAS no seguinte formato JSON:
 
         val messages = buildList {
             add(Message(role = "system", content = coordinator.systemPrompt))
-            addAll(contextMessages)  // conversation history injected here
+            addAll(context.recentMessages)  // short-term context from Stage 1
             add(Message(role = "user", content = decisionPrompt))
         }
 
-        val response = callLLM(messages, maxTokens = 500, temperature = 0.3)
+        val response = callLLM(messages, maxTokens = 500, temperature = 0.3f)
             ?: return null  // propagated as Result.failure in processUserMessage
 
         return try {
             parseAgentDecision(response)
         } catch (e: Exception) {
             // Fallback: single coordinator agent, sequential order.
-            // This handles malformed JSON, missing fields, type mismatches, etc.
+            // Handles malformed JSON, missing fields, type mismatches, etc.
             AgentDecision(
                 selectedAgents = listOf(coordinator.id),
                 reasoning = "Fallback para coordenador devido a erro no parsing",
@@ -506,42 +752,65 @@ Responda APENAS no seguinte formato JSON:
     }
 
     /**
-     * Step 6 implementation — calls each selected agent's LLM sequentially.
+     * Stage 4 execution — calls each selected agent's LLM sequentially.
+     *
+     * Receives the full [PipelineContext] and passes it to each agent call so
+     * every agent has access to:
+     *   - pipelineContext.userMessage    (original user turn)
+     *   - pipelineContext.recentMessages (short-term history, Stage 1)
+     *   - pipelineContext.memorySnippets (long-term memory, Stage 2)
+     *   - pipelineContext.intentLabel / intentScore (Stage 3 classification)
      *
      * Context payload delivered to each agent's LLM call:
      *   index 0          : Message(role="system", content=agent.systemPrompt)
-     *   indices 1..N     : contextMessages (history, api.model.Message, DESC order)
-     *   last index       : Message(role="user", content=userMessage)
+     *   [memory section] : serialised pipelineContext.memorySnippets (if non-empty)
+     *   indices 1..N     : pipelineContext.recentMessages (history, DESC order)
+     *   last index       : Message(role="user", content=pipelineContext.userMessage)
      *
      * Agent-level LLM parameters:
-     *   maxTokens   : agent.maxTokens  (entity field, may be null → LLMClient default)
+     *   maxTokens   : agent.maxTokens   (entity field, may be null → LLMClient default)
      *   temperature : agent.temperature (entity field, may be null → LLMClient default)
      *
      * Per-agent failures (unknown ID, null LLM response) are silently skipped.
-     * Consider adding auditLogger.logWarning() for observability (docs §5).
      *
      * @return Result.success(concatenatedResponses) or
      *         Result.failure if every agent returned null.
      */
     private suspend fun executeWithAgents(
         agentIds: List<String>,
-        userMessage: String,
-        contextMessages: List<Message>,
+        context: PipelineContext,
         correlationId: String
     ): Result<String> {
         val results = mutableListOf<String>()
 
+        // Serialise memory snippets once; reuse for every agent call to avoid
+        // re-allocating the same string N times inside the loop.
+        val memoryContext = if (context.memorySnippets.isNotEmpty()) {
+            "Memórias relevantes:\n" +
+                context.memorySnippets.joinToString("\n") { memory ->
+                    "  [${memory.type.name}] ${memory.key}: ${memory.value.take(150)}"
+                } + "\n\n"
+        } else {
+            ""  // No memory snippets; omit memory section
+        }
+
         for (agentId in agentIds) {
             // Unknown agent IDs: silently skip.  This can happen if an agent was
-            // deleted between the routing decision (Step 5) and execution (Step 6).
+            // deleted between the routing decision (Stage 3/4) and execution.
             val agent = agentManager.getAgent(agentId) ?: continue
 
-            // Context payload — see data contract in docs/agent-orchestrator.md
-            // §Agent Context Data Contract.
+            // Build the context payload for this agent call.
+            // Memory snippets (Stage 2) are injected as a system-level message
+            // immediately after the agent's own system prompt so the LLM treats
+            // them as authoritative background knowledge.
             val messages = buildList {
                 add(Message(role = "system", content = agent.systemPrompt))
-                addAll(contextMessages)  // conversation history
-                add(Message(role = "user", content = userMessage))
+                // Inject long-term memory as an additional system context segment
+                if (memoryContext.isNotEmpty()) {
+                    add(Message(role = "system", content = memoryContext))
+                }
+                addAll(context.recentMessages)  // short-term history (Stage 1)
+                add(Message(role = "user", content = context.userMessage))
             }
 
             val response = callLLM(messages, agent.maxTokens, agent.temperature)
@@ -559,12 +828,11 @@ Responda APENAS no seguinte formato JSON:
                     correlationId = correlationId
                 )
             }
-            // Null response: no warning logged here.  See docs §Known Limitations #5.
+            // Null response: silently skipped; no warning logged.
         }
 
         return if (results.isNotEmpty()) {
             // Multiple agent responses are concatenated; no synthesis step exists yet.
-            // See docs §Known Limitations #4.
             Result.success(results.joinToString("\n\n---\n\n"))
         } else {
             Result.failure(Exception("Nenhum agente conseguiu responder"))
@@ -572,7 +840,7 @@ Responda APENAS no seguinte formato JSON:
     }
 
     /**
-     * Step 7 implementation — submits the final response to an AUDITOR agent.
+     * Stage 5 implementation — submits the final response to an AUDITOR agent.
      *
      * LLM call parameters: maxTokens=500, temperature=0.2 (highly deterministic).
      * Detects "REPROVADO" substring in the auditor's response.
@@ -625,7 +893,7 @@ Responda com:
             Message(role = "user", content = auditPrompt)
         )
 
-        val auditResponse = callLLM(messages, maxTokens = 500, temperature = 0.2)
+        val auditResponse = callLLM(messages, maxTokens = 500, temperature = 0.2f)
 
         auditLogger.logAction(
             action = "Auditoria cruzada",
@@ -647,7 +915,7 @@ Responda com:
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Centralised LLM call gateway used by all pipeline steps.
+     * Centralised LLM call gateway used by all pipeline stages.
      *
      * Lazily re-initialises llmClient if null (covers the case where
      * initializeLLM() was not called before the first processUserMessage()).
@@ -695,7 +963,7 @@ Responda com:
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Persists a user-authored message to the messages table (Step 1).
+     * Persists a user-authored message to the messages table (Stage 1).
      *
      * Uses OnConflictStrategy.REPLACE.  The auto-generated Long id is discarded.
      * Failure propagates to the outer catch in processUserMessage.
@@ -710,14 +978,13 @@ Responda com:
     }
 
     /**
-     * Persists an agent-authored message to the messages table (Steps 0 and 8).
+     * Persists an agent-authored message to the messages table (Stages 0 and 6).
      *
      * @param agentId    The persisted agent's entity ID; "system" for command responses.
      * @param agentName  Display name shown in the UI; "Sistema" for command responses.
      *
-     * NOTE: When multiple agents responded in Step 6, this is called once with the
+     * NOTE: When multiple agents responded in Stage 4, this is called once with the
      * coordinator's ID/name.  Individual per-agent attributions are in the audit log.
-     * See docs §Known Limitations #9.
      */
     private suspend fun saveAgentMessage(
         content: String,
@@ -736,20 +1003,26 @@ Responda com:
     }
 
     /**
-     * Loads conversation history for LLM context hydration (Step 2).
+     * Stage 1 implementation — loads conversation history for LLM context hydration.
      *
      * Calls: MessageDao.getRecentMessages(conversationId, MAX_CONTEXT_MESSAGES)
-     *   - conversationId : scopes the query to the current conversation bucket
-     *   - limit          : MAX_CONTEXT_MESSAGES = 10
-     *   - order          : timestamp DESC (newest first — see docs §Known Limitations #3)
      *
-     * Maps entity.Message → api.model.Message using role translation:
-     *   SenderType.USER   → "user"
-     *   SenderType.AGENT  → "assistant"
-     *   SenderType.SYSTEM → "system"
+     * Parameters:
+     *   conversationId : scopes the query to the current conversation bucket
+     *   limit          : MAX_CONTEXT_MESSAGES = 10
      *
-     * The resulting list is injected between the system prompt and the current user
-     * turn in every LLM call within this pipeline invocation.
+     * Return shape:
+     *   List<entity.Message>, ORDER BY timestamp DESC (newest first)
+     *   Mapped to List<api.model.Message> via SenderType → OpenAI role translation:
+     *     SenderType.USER   → "user"
+     *     SenderType.AGENT  → "assistant"
+     *     SenderType.SYSTEM → "system"
+     *
+     * The resulting list is stored in PipelineContext.recentMessages and injected
+     * between the system prompt and the current user turn in every LLM call.
+     *
+     * NOTE: Messages arrive newest-first (DESC order).  Consider reversing before
+     * injecting into prompts if chronological order is required.
      *
      * Failure propagates to the outer catch in processUserMessage → Result.failure.
      */
@@ -772,23 +1045,26 @@ Responda com:
     }
 
     /**
-     * Retrieves semantically relevant memories for the current user message (Step 3).
+     * Stage 2 implementation — retrieves semantically relevant memories.
      *
-     * Algorithm:
-     *   1. Tokenise userMessage: lowercase → split on space → drop tokens ≤ 3 chars
-     *      → take first 5 keywords. (Simple stop-word removal heuristic.)
-     *   2. For each keyword call MemoryDao.searchMemories(keyword):
-     *        SQL: LIKE '%<keyword>%' on columns key, value, category
-     *        Filter: is_archived = 0
-     *        Sort: importance DESC, access_count DESC
-     *   3. Aggregate, de-duplicate by id, sort by importance DESC, cap at 5.
+     * Derives a search query from userMessage:
+     *   userMessage.lowercase().split(" ").filter { it.length > 3 }.take(5)
+     * Each token becomes one call to MemoryDao.searchMemories(keyword).
      *
-     * IMPORTANT: the returned list is currently NOT injected into the LLM prompt.
-     * It is retrieved here to validate retrieval correctness and to facilitate the
-     * planned memory-injection feature.  See docs/agent-orchestrator.md §1.
+     * DAO query per keyword:
+     *   SQL   : LIKE '%<keyword>%' on columns key, value, category
+     *   Filter: is_archived = 0 (active memories only)
+     *   Sort  : importance DESC, access_count DESC
      *
-     * Error handling: all DB exceptions are caught internally; returns emptyList()
-     * so memory retrieval failure is always non-fatal to the pipeline.
+     * Post-aggregation: distinctBy { id }, sortedByDescending { importance }, take(5).
+     * Stored in PipelineContext.memorySnippets.
+     *
+     * Null / empty result: always defaults to emptyList() — NEVER throws.
+     * All DB exceptions are caught internally; memory retrieval failure is
+     * always non-fatal to the pipeline.
+     *
+     * @param query  The raw user message; keywords are derived internally.
+     * @return List<entity.Memory> of up to 5 relevant memories, or emptyList().
      */
     private suspend fun getRelevantMemories(
         query: String
@@ -799,11 +1075,23 @@ Responda com:
                 .filter { it.length > 3 }  // drop short / stop-word tokens
                 .take(5)                    // cap DB calls at 5
 
+            if (keywords.isEmpty()) {
+                return emptyList()
+            }
+
             val memories = mutableListOf<com.agente.autonomo.data.entity.Memory>()
 
             for (keyword in keywords) {
-                val found = database.memoryDao().searchMemories(keyword)
-                memories.addAll(found)
+                // searchMemories returns null on some DAO implementations; guard here
+                // to ensure the Stage 2 contract (never throws, defaults to []) holds.
+                val found = try {
+                    database.memoryDao().searchMemories(keyword)
+                } catch (inner: Exception) {
+                    null  // individual keyword failure is non-fatal
+                }
+                if (found != null) {
+                    memories.addAll(found)
+                }
             }
 
             // De-duplicate across keywords, sort by importance, hard ceiling of 5.
@@ -811,14 +1099,14 @@ Responda com:
                 .sortedByDescending { it.importance }
                 .take(5)
         } catch (e: Exception) {
-            // Non-fatal: pipeline continues without memories.
-            // Consider adding auditLogger.logWarning() here for observability.
+            // Non-fatal: pipeline continues with empty memory context.
             emptyList()
         }
     }
 
     /**
-     * Persists a summary of the current exchange as a CONTEXT-type Memory (Step 9).
+     * Stage 7 implementation — persists a summary of the current exchange as a
+     * CONTEXT-type Memory.
      *
      * Memory fields:
      *   id             : UUID
@@ -828,9 +1116,10 @@ Responda com:
      *   conversationId : scoping key
      *   importance     : 5 (mid-range, hardcoded)
      *
-     * KNOWN ISSUE: failure here is NOT wrapped in its own try/catch, meaning a DB
-     * error during memory write will cause processUserMessage to return Result.failure
-     * even though the LLM response was already obtained.  See docs §Known Limitations #6.
+     * KNOWN ISSUE: failure here is NOT wrapped in its own try/catch.  A DB
+     * error during memory write causes processUserMessage to return Result.failure
+     * even though the LLM response was already obtained.  Consider wrapping in
+     * try/catch to make memory persistence non-critical.
      */
     private suspend fun updateMemory(
         userMessage: String,
@@ -856,7 +1145,7 @@ Responda com:
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Builds the agent enumeration string injected into the routing prompt (Step 5).
+     * Builds the agent enumeration string injected into the routing prompt (Stage 4).
      *
      * Calls AgentManager.getAllActiveAgents().first() to get a snapshot of all
      * agents where isActive = true from AgentDao.
@@ -895,7 +1184,7 @@ Responda com:
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Result of the LLM-assisted routing decision (Step 5).
+     * Result of the LLM-assisted routing decision (Stage 4).
      *
      * Kotlin equivalent of the expected LLM JSON response:
      * {
