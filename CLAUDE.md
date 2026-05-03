@@ -28,10 +28,12 @@ The project follows a layered architecture pattern:
 ├─────────────────────────────────────────────┤
 │                API Layer                     │
 │  LLMClient → LLMApiService (Retrofit)        │
+│  FallbackLLMClient (offline-first chain)     │
 │  MemoryApiClient (remote memory server)      │
 ├─────────────────────────────────────────────┤
 │               Data Layer                     │
 │  Room Database → DAOs → Entities             │
+│  OfflineResponseCache (local LLM cache)      │
 ├─────────────────────────────────────────────┤
 │              Service Layer                   │
 │  AgenteAutonomoService (ForegroundService)   │
@@ -65,7 +67,8 @@ The `AgentOrchestrator` implements a **sequential multi-agent pipeline** for eve
    getRelevantMemories() → MemoryDao.searchMemories()
 4. AgentManager.getCoordinatorAgent() → AgentDao
        ↓
-5. LLMClient.sendMessage(coordinatorAgent, context, memories)
+5. FallbackLLMClient.sendMessage(coordinatorAgent, context, memories)
+       ↓ (tries primary LLMClient → fallback providers → offline cache)
        ↓ coordinator response
 6. [Optional] Route to specialized sub-agents based on coordinator output
        ↓ (RESEARCHER / PLANNER / EXECUTOR / etc.)
@@ -80,8 +83,50 @@ The `AgentOrchestrator` implements a **sequential multi-agent pipeline** for eve
 - Each agent step uses the **same `correlationId`** (UUID) so the full pipeline is traceable in audit logs
 - Memory retrieval is done **once before the pipeline starts** and injected into each agent's context
 - Conversation context (recent messages) is prepended to every agent's system prompt
-- If `LLMClient` is null (no API key configured), the pipeline short-circuits and returns an error result
+- If all LLM providers fail and no offline cache entry exists, the pipeline returns a meaningful degraded-mode error result
 - If `conversationProgrammer` is not initialized, programming commands are skipped gracefully
+
+### Offline-First LLM Fallback Chain
+
+The app implements an **offline-first fallback chain** so the agent pipeline degrades gracefully rather than failing hard when the primary LLM provider is unavailable.
+
+#### FallbackLLMClient
+
+`FallbackLLMClient` wraps multiple `LLMClient` instances and an `OfflineResponseCache`. On each `sendMessage()` call it:
+
+1. **Tries the primary `LLMClient`** (configured provider in Settings)
+2. **Iterates through ordered fallback providers** (e.g., Groq → OpenRouter → GitHub Models → Cloudflare) if the primary fails
+3. **Consults `OfflineResponseCache`** if all network providers fail; returns the best cached response for the given prompt/agent type
+4. **Returns `Result.failure()`** with a descriptive error only if no cached response is available
+
+Provider priority order is configurable; the default order is defined in `FallbackLLMClient.Companion.DEFAULT_PROVIDER_ORDER`.
+
+#### OfflineResponseCache
+
+`OfflineResponseCache` is a Room-backed local cache of LLM responses:
+
+- **Entity:** `CachedResponse` – stores prompt hash, agent type, response text, provider, timestamp, hit count
+- **DAO:** `CachedResponseDao` – lookup by prompt hash + agent type; eviction of oldest entries when cache exceeds `MAX_CACHE_SIZE`
+- **Cache key:** SHA-256 hash of the normalized prompt text + agent type enum name
+- **Eviction policy:** LRU-style; entries beyond `MAX_CACHE_SIZE` (default 500) are evicted by oldest `lastAccessed` timestamp
+- **TTL:** Cached entries expire after `CACHE_TTL_MS` (default 7 days); expired entries are excluded from lookups and cleaned up lazily
+
+#### FallbackChainSettings
+
+Settings entity gains additional fields to control fallback behavior:
+- `fallbackProvidersEnabled: Boolean` – master switch for the fallback chain (default `true`)
+- `fallbackProviderOrder: String` – JSON array of `ApiProvider` enum names defining attempt order
+- `offlineCacheEnabled: Boolean` – whether to use `OfflineResponseCache` as last resort (default `true`)
+- `offlineCacheTtlDays: Int` – TTL in days for cached responses (default 7)
+
+These are exposed in `SettingsActivity` alongside existing API configuration.
+
+#### Audit Logging for Fallback Events
+
+Each provider attempt (success or failure) and each cache hit/miss is recorded via `AuditLogger.logAction()` with:
+- `type = AuditLogType.SYSTEM`
+- `action` values: `"llm_primary_success"`, `"llm_primary_failure"`, `"llm_fallback_attempt"`, `"llm_fallback_success"`, `"llm_fallback_failure"`, `"llm_cache_hit"`, `"llm_cache_miss"`, `"llm_all_providers_failed"`
+- The same `correlationId` as the enclosing pipeline step, enabling full tracing of which provider ultimately served each request
 
 ### Sub-Agent Routing Logic
 
@@ -97,7 +142,7 @@ The COORDINATOR's response text is parsed to determine which sub-agents to invok
 
 The pipeline is formally documented via:
 - **Inline KDoc comments** on `AgentOrchestrator` methods describing each pipeline step, guard conditions, and expected behavior
-- **Unit tests** (in `test/` source set) covering: guard conditions (null LLMClient, uninitialized programmer), happy-path single-coordinator flow, sub-agent routing, audit step gating, and correlationId propagation
+- **Unit tests** (in `test/` source set) covering: guard conditions (null LLMClient, uninitialized programmer), happy-path single-coordinator flow, sub-agent routing, audit step gating, correlationId propagation, fallback chain behavior, and offline cache interactions
 
 ---
 
@@ -142,7 +187,7 @@ All providers use OpenAI-compatible `chat/completions` API format.
 ### Agent System
 | File | Purpose |
 |------|---------|
-| `agent/AgentOrchestrator.kt` | Core orchestration logic; implements the sequential multi-agent pipeline; manages conversation context, memory retrieval, sub-agent routing, and audit steps; all state is tied together via `correlationId`; fully KDoc-documented per pipeline step |
+| `agent/AgentOrchestrator.kt` | Core orchestration logic; implements the sequential multi-agent pipeline; manages conversation context, memory retrieval, sub-agent routing, and audit steps; all state is tied together via `correlationId`; uses `FallbackLLMClient` instead of `LLMClient` directly; fully KDoc-documented per pipeline step |
 | `agent/AgentManager.kt` | CRUD operations for agents; retrieves agents by type/capability; logs agent usage via `AuditLogger` |
 | `agent/ConversationAgentProgrammer.kt` | Natural language command parser; intercepts messages matching patterns to create/modify/delete agents and tasks; supports both Portuguese and English commands; must be initialized before use |
 
@@ -151,6 +196,8 @@ All providers use OpenAI-compatible `chat/completions` API format.
 |------|---------|
 | `api/LLMApiService.kt` | Retrofit interface for OpenAI-compatible `POST chat/completions`; includes streaming variant |
 | `api/LLMClient.kt` | Configures OkHttp + Retrofit per provider; handles retries, auth headers, timeout (60s); exposes `sendMessage()` and streaming flow |
+| `api/FallbackLLMClient.kt` | Wraps multiple `LLMClient` instances and `OfflineResponseCache`; implements ordered provider fallback chain; logs each attempt outcome via `AuditLogger`; exposes same `sendMessage()` interface as `LLMClient` |
+| `api/OfflineResponseCache.kt` | Room-backed LRU cache for LLM responses; keyed by SHA-256(prompt + agentType); TTL-based expiry; lazy eviction of oldest entries beyond `MAX_CACHE_SIZE` |
 | `api/MemoryApiClient.kt` | Connects to remote Next.js memory server at `https://preview-chat-68144e5f.space.z.ai`; manages user identity caching |
 | `api/model/LLMModels.kt` | All request/response data classes (`ChatCompletionRequest`, `Message`, `ChatCompletionResponse`, `Choice`, `Delta`, etc.); `ApiProvider` enum; `AvailableModels` catalog |
 
@@ -164,7 +211,8 @@ All providers use OpenAI-compatible `chat/completions` API format.
 | `Memory` | `memories` | id, key, value, type (enum), category, sourceAgent, conversationId, importance, isArchived, expiresAt, accessCount |
 | `AuditLog` | `audit_logs` | id (auto), type (enum), action, agentId, agentName, details, status (enum), durationMs, correlationId, isSynced |
 | `Task` | `tasks` | Scheduled/pending tasks |
-| `Settings` | `settings` | id=1 (singleton), apiKey, apiProvider, apiModel, apiBaseUrl, temperature, maxTokens, serviceEnabled, autoStart, auditEnabled |
+| `CachedResponse` | `cached_responses` | id (auto), promptHash, agentType, responseText, provider, createdAt, lastAccessed, hitCount |
+| `Settings` | `settings` | id=1 (singleton), apiKey, apiProvider, apiModel, apiBaseUrl, temperature, maxTokens, serviceEnabled, autoStart, auditEnabled, fallbackProvidersEnabled, fallbackProviderOrder, offlineCacheEnabled, offlineCacheTtlDays |
 
 #### DAOs
 All DAOs follow consistent patterns:
@@ -178,72 +226,19 @@ All DAOs follow consistent patterns:
 | `MessageDao` | `getMessagesByConversation()`, `getRecentMessages()`, `getUnsyncedMessages()`, `searchMessages()` |
 | `MemoryDao` | `searchMemories()`, `deleteExpiredMemories()`, `updateAccess()`, `getMemoriesByConversation()` |
 | `AuditLogDao` | `getLogsByCorrelationId()`, `getLogsSince()`, `getUnsyncedLogs()`, `getAverageDuration()` |
+| `CachedResponseDao` | `findByPromptHash(promptHash, agentType)`, `updateLastAccessed()`, `incrementHitCount()`, `deleteExpiredEntries(before)`, `deleteOldestBeyondLimit(limit)`, `countAll()` |
 | `SettingsDao` | Singleton pattern (id=1); `getSettingsSync()` for non-Flow access |
 | `TaskDao` | Scheduled task management |
 
 #### Database
 | File | Purpose |
 |------|---------|
-| `data/database/AppDatabase.kt` | Room `@Database` class; singleton via `getDatabase(context)`; defines all entity/DAO registrations |
+| `data/database/AppDatabase.kt` | Room `@Database` class; singleton via `getDatabase(context)`; defines all entity/DAO registrations including `CachedResponse` and `CachedResponseDao` |
 
 ### Service Layer
 | File | Purpose |
 |------|---------|
 | `service/AgenteAutonomoService.kt` | Persistent `ForegroundService`; main execution loop for 24/7 operation |
 | `service/BootReceiver.kt` | `BroadcastReceiver` for `RECEIVE_BOOT_COMPLETED`; starts service after device reboot |
-| `service/NetworkReceiver.kt` | `BroadcastReceiver` for connectivity changes; triggers LLM reconnection |
-| `service/RestartService.kt` | Service that restarts the main service if killed |
-| `service/ServiceRestartJob.kt` | `JobService` using `JobScheduler` for system-level service restart scheduling |
-
-### UI Layer
-| File | Purpose |
-|------|---------|
-| `ui/activities/MainActivity.kt` | App entry point/dashboard |
-| `ui/activities/ChatActivity.kt` | Primary chat interface |
-| `ui/activities/AgentsActivity.kt` | Agent management screen |
-| `ui/activities/AuditActivity.kt` | Audit log viewer |
-| `ui/activities/SettingsActivity.kt` | API configuration and app settings |
-| `ui/adapters/MessageAdapter.kt` | RecyclerView adapter for chat messages (3 view types: user/agent/system) |
-| `ui/adapters/AgentAdapter.kt` | RecyclerView adapter for agent list |
-| `ui/adapters/AuditLogAdapter.kt` | RecyclerView adapter for audit entries |
-
-### Utilities
-| File | Purpose |
-|------|---------|
-| `utils/AuditLogger.kt` | Utility class wrapping `AuditLogDao`; provides `logAction()` with correlationId support |
-| `utils/DateConverter.kt` | Room `TypeConverter` for `Date` ↔ `Long` conversion |
-
-### Tests
-| File | Purpose |
-|------|---------|
-| `test/agent/AgentOrchestratorTest.kt` | Unit tests for the multi-agent pipeline; covers guard conditions, happy-path coordinator flow, sub-agent routing by keyword, audit step gating via `auditEnabled`, and correlationId propagation across all pipeline steps |
-
----
-
-## Coding Conventions
-
-### Kotlin Style
-- **Coroutines**: All I/O operations use `withContext(Dispatchers.IO)` or are declared `suspend`
-- **Flow**: Used for reactive UI data streams from Room DAOs; collected in Activities/Adapters
-- **Result<T>**: Used as return type for operations that can fail (e.g., `Result.success()`, `Result.failure()`)
-- **Companion Objects**: Used for constants (`TAG`, pattern lists, timeouts)
-- **Named Parameters**: Kotlin named arguments used extensively in data class construction
-- **Extension-style**: `apply {}` blocks used for configuration (OkHttp, NotificationChannel)
-
-### Architecture Conventions
-- **Dependency injection is manual** (constructor injection); no DI framework like Hilt/Dagger
-- **Singleton DB access**: `AppDatabase.getDatabase(context)` provides thread-safe singleton
-- **Settings as singleton**: `Settings` entity always uses `id = 1`; accessed via `getSettingsSync()` for non-reactive needs
-- **CorrelationId pattern**: Operations generate `UUID.randomUUID().toString()` at the start of `processUserMessage()`; the same UUID propagates through every agent step and every `AuditLogger.logAction()` call, enabling full end-to-end tracing of a single user request in `AuditLogDao.getLogsByCorrelationId()`
-- **Agent capabilities**: Stored as JSON array string in the `capabilities` column (e.g., `["search","write"]`)
-- **Early-exit guards**: Both `LLMClient == null` and `::conversationProgrammer.isInitialized` are checked at the top of pipeline entry points before any async work begins
-- **Memory injection pattern**: Relevant memories are retrieved once per request via `MemoryDao.searchMemories()` and passed as additional context into each agent's prompt; they are not re-fetched per agent step
-- **Audit-gated steps**: The AUDITOR cross-check step is conditionally executed based on `settings.auditEnabled`; always read settings via `getSettingsSync()` inside the pipeline
-- **Sub-agent routing is keyword-based**: The COORDINATOR's response text is scanned for Portuguese/English keywords to determine which specialized sub-agents to invoke; routing is additive (multiple sub-agents may be triggered by a single coordinator response)
-- **KDoc documentation standard**: All public methods in `AgentOrchestrator` are documented with KDoc including `@param`, `@return`, and step-by-step pipeline descriptions; this is the established standard for agent layer classes
-
-### Testing Conventions
-- **Test framework**: JUnit4 with Kotlin Coroutines Test (`runTest` / `TestCoroutineDispatcher`)
-- **Mocking**: Mockito or MockK for mocking DAOs, `LLMClient`, `AgentManager`, and `AuditLogger`
-- **Test scope**: Unit tests focus on `AgentOrchestrator` pipeline logic in isolation; DAO interactions are mocked
-- **Test naming**: Descriptive `fun` names using backtick strings (e.g., `` `processUserMessage returns failure when LLMClient
+| `service/NetworkReceiver.kt` | `BroadcastReceiver` for connectivity changes; triggers LLM reconnection; also triggers `FallbackLLMClient` to re-attempt primary provider after network restore |
+| `service/
