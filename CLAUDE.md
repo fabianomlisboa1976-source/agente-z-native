@@ -83,6 +83,22 @@ The `AgentOrchestrator` implements a **sequential multi-agent pipeline** for eve
 - If `LLMClient` is null (no API key configured), the pipeline short-circuits and returns an error result
 - If `conversationProgrammer` is not initialized, programming commands are skipped gracefully
 
+### Sub-Agent Routing Logic
+
+The COORDINATOR's response text is parsed to determine which sub-agents to invoke. Routing decisions are keyword/pattern-based:
+- Keywords like `pesquisa`, `busca`, `research`, `search` → route to **RESEARCHER**
+- Keywords like `plano`, `planejamento`, `plan`, `organize` → route to **PLANNER**
+- Keywords like `executa`, `implementa`, `execute`, `implement` → route to **EXECUTOR**
+- Keywords like `comunica`, `envia`, `communicate`, `send` → route to **COMMUNICATION**
+- If no specialized routing keyword is found, the COORDINATOR's response is used as the final answer
+- Sub-agent responses are concatenated and returned as a composite final response when multiple agents are invoked
+
+### Pipeline Documentation and Testing
+
+The pipeline is formally documented via:
+- **Inline KDoc comments** on `AgentOrchestrator` methods describing each pipeline step, guard conditions, and expected behavior
+- **Unit tests** (in `test/` source set) covering: guard conditions (null LLMClient, uninitialized programmer), happy-path single-coordinator flow, sub-agent routing, audit step gating, and correlationId propagation
+
 ---
 
 ## Tech Stack
@@ -100,6 +116,7 @@ The `AgentOrchestrator` implements a **sequential multi-agent pipeline** for eve
 | Background Work | Foreground Service + JobScheduler (`ServiceRestartJob`) |
 | Build | Gradle Kotlin DSL |
 | CI/CD | GitHub Actions (`.github/workflows/build-apk.yml`) |
+| Testing | JUnit4 + Kotlin Coroutines Test (`runTest`) + Mockito/MockK |
 
 ### LLM API Providers
 
@@ -125,7 +142,7 @@ All providers use OpenAI-compatible `chat/completions` API format.
 ### Agent System
 | File | Purpose |
 |------|---------|
-| `agent/AgentOrchestrator.kt` | Core orchestration logic; implements the sequential multi-agent pipeline; manages conversation context, memory retrieval, sub-agent routing, and audit steps; all state is tied together via `correlationId` |
+| `agent/AgentOrchestrator.kt` | Core orchestration logic; implements the sequential multi-agent pipeline; manages conversation context, memory retrieval, sub-agent routing, and audit steps; all state is tied together via `correlationId`; fully KDoc-documented per pipeline step |
 | `agent/AgentManager.kt` | CRUD operations for agents; retrieves agents by type/capability; logs agent usage via `AuditLogger` |
 | `agent/ConversationAgentProgrammer.kt` | Natural language command parser; intercepts messages matching patterns to create/modify/delete agents and tasks; supports both Portuguese and English commands; must be initialized before use |
 
@@ -196,6 +213,11 @@ All DAOs follow consistent patterns:
 | `utils/AuditLogger.kt` | Utility class wrapping `AuditLogDao`; provides `logAction()` with correlationId support |
 | `utils/DateConverter.kt` | Room `TypeConverter` for `Date` ↔ `Long` conversion |
 
+### Tests
+| File | Purpose |
+|------|---------|
+| `test/agent/AgentOrchestratorTest.kt` | Unit tests for the multi-agent pipeline; covers guard conditions, happy-path coordinator flow, sub-agent routing by keyword, audit step gating via `auditEnabled`, and correlationId propagation across all pipeline steps |
+
 ---
 
 ## Coding Conventions
@@ -217,66 +239,11 @@ All DAOs follow consistent patterns:
 - **Early-exit guards**: Both `LLMClient == null` and `::conversationProgrammer.isInitialized` are checked at the top of pipeline entry points before any async work begins
 - **Memory injection pattern**: Relevant memories are retrieved once per request via `MemoryDao.searchMemories()` and passed as additional context into each agent's prompt; they are not re-fetched per agent step
 - **Audit-gated steps**: The AUDITOR cross-check step is conditionally executed based on `settings.auditEnabled`; always read settings via `getSettingsSync()` inside the pipeline
+- **Sub-agent routing is keyword-based**: The COORDINATOR's response text is scanned for Portuguese/English keywords to determine which specialized sub-agents to invoke; routing is additive (multiple sub-agents may be triggered by a single coordinator response)
+- **KDoc documentation standard**: All public methods in `AgentOrchestrator` are documented with KDoc including `@param`, `@return`, and step-by-step pipeline descriptions; this is the established standard for agent layer classes
 
-### Naming Conventions
-- Activities: `*Activity.kt`
-- Adapters: `*Adapter.kt`
-- DAOs: `*Dao.kt` (interfaces)
-- Entities: singular noun (e.g., `Agent.kt`, `Message.kt`)
-- Services: `*Service.kt`
-- Receivers: `*Receiver.kt`
-
-### Localization
-- The codebase is **bilingual** (Portuguese/English)
-- User-facing strings in `res/values/strings.xml`
-- Command patterns in `ConversationAgentProgrammer` support both Portuguese and English
-- Comments in source code are primarily in Portuguese
-
----
-
-## Data Flow: Processing a User Message
-
-```
-User Input (ChatActivity)
-    ↓
-AgentOrchestrator.processUserMessage()
-    ↓
-[Guard] LLMClient != null? → else return Result.failure()
-[Guard] conversationProgrammer.isInitialized? → skip if not
-    ↓
-ConversationAgentProgrammer.processMessage()  ← Check for programming commands
-    ↓ (if command matched → return early with command result)
-    ↓ (if not a command → continue)
-saveUserMessage() → MessageDao
-    ↓
-getConversationContext() → MessageDao.getRecentMessages()
-getRelevantMemories() → MemoryDao.searchMemories()
-    ↓
-correlationId = UUID.randomUUID().toString()  ← Single UUID for entire pipeline
-    ↓
-AgentManager.getCoordinatorAgent() → AgentDao
-    ↓
-LLMClient.sendMessage(coordinator + context + memories)
-AuditLogger.logAction(correlationId) → AuditLogDao
-    ↓
-[Coordinator output parsed] → route to sub-agents (RESEARCHER / PLANNER / EXECUTOR / etc.)
-    each sub-agent: LLMClient.sendMessage() + AuditLogger.logAction(same correlationId)
-    each sub-agent: saveAgentMessage() → MessageDao
-    ↓
-[if settings.auditEnabled]
-AgentManager.getAuditorAgent() → AgentDao
-LLMClient.sendMessage(auditor + full context)
-AuditLogger.logAction(correlationId) → AuditLogDao
-    ↓
-saveAgentMessage() (final response) → MessageDao
-    ↓
-Return Result<String> to UI
-```
-
----
-
-## Permissions
-
-The app requests extensive Android permissions:
-- **Network**: `INTERNET`, `ACCESS_NETWORK_STATE`
-- **Background**: `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA
+### Testing Conventions
+- **Test framework**: JUnit4 with Kotlin Coroutines Test (`runTest` / `TestCoroutineDispatcher`)
+- **Mocking**: Mockito or MockK for mocking DAOs, `LLMClient`, `AgentManager`, and `AuditLogger`
+- **Test scope**: Unit tests focus on `AgentOrchestrator` pipeline logic in isolation; DAO interactions are mocked
+- **Test naming**: Descriptive `fun` names using backtick strings (e.g., `` `processUserMessage returns failure when LLMClient
