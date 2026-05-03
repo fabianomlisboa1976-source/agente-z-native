@@ -3,507 +3,467 @@ package com.agente.autonomo.agent
 import android.content.Context
 import android.util.Log
 import com.agente.autonomo.api.FallbackLLMClient
-import com.agente.autonomo.api.LLMClient
-import com.agente.autonomo.api.ProviderHealthRepository
-import com.agente.autonomo.api.ProviderHealthChecker
+import com.agente.autonomo.api.model.ApiProvider
 import com.agente.autonomo.api.model.Message
-import com.agente.autonomo.data.database.AppDatabase
-import com.agente.autonomo.data.entity.Agent
-import com.agente.autonomo.data.entity.AgentType
+import com.agente.autonomo.data.dao.AgentDao
+import com.agente.autonomo.data.dao.AuditLogDao
+import com.agente.autonomo.data.dao.MemoryDao
+import com.agente.autonomo.data.dao.MessageDao
+import com.agente.autonomo.data.dao.SettingsDao
+import com.agente.autonomo.data.entity.AuditLog
 import com.agente.autonomo.data.entity.Memory
 import com.agente.autonomo.data.entity.SenderType
-import com.agente.autonomo.service.ProviderExhaustedNotifier
+import com.agente.autonomo.memory.EmbeddingEngine
+import com.agente.autonomo.memory.MemorySearchEngine
 import com.agente.autonomo.utils.AuditLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.Date
 import java.util.UUID
 
 /**
- * Core orchestration class for the multi-agent pipeline.
+ * Central orchestrator for the multi-agent sequential pipeline.
  *
- * ## Pipeline overview
- * Every call to [processUserMessage] executes the following sequential steps:
+ * ## Pipeline stages (per [processUserMessage] invocation)
  *
- * ### Step 0 – Guard conditions
- * - If [llmClient] is `null`, return `Result.failure` immediately.
- * - If [conversationProgrammer] is not initialized, skip the command-intercept
- *   step and continue with the full pipeline.
+ * ```
+ * Stage 0 — Intercept special commands
+ *       ↓
+ * Stage 1 — Fetch recent messages (short-term context)
+ *       ↓
+ * Stage 2 — Semantic memory retrieval via [MemorySearchEngine] (long-term context)
+ *       ↓
+ * Stage 3 — Classify intent and select routing target
+ *       ↓
+ * Stage 4 — Route message to one or more agents and collect responses
+ *       ↓
+ * Stage 5 — Optional cross-audit by AUDITOR agent
+ *       ↓
+ * Stage 6 — Persist agent response to MessageDao
+ *       ↓
+ * Stage 7 — Optional memory update (store conversation turn)
+ * ```
  *
- * ### Step 1 – Command intercept
- * [ConversationAgentProgrammer.processMessage] is called first.  If it
- * recognises a programming command (create/modify/delete agent or task) it
- * handles the request and this method returns early with the programmer's
- * result, bypassing the LLM pipeline.
+ * All stages share a single [correlationId] for end-to-end audit tracing.
  *
- * ### Step 2 – Persist user message
- * The raw user text is saved to [MessageDao] under the active
- * [conversationId].
+ * ## Memory retrieval
+ * Stage 2 delegates to [MemorySearchEngine.search] which performs:
+ * 1. Vector cosine-similarity ranking against pre-computed ONNX embeddings.
+ * 2. Transparent keyword fallback for legacy rows without embeddings.
  *
- * ### Step 3 – Context assembly
- * - Recent messages are loaded from [MessageDao.getRecentMessages].
- * - Relevant memories are retrieved once via [MemoryDao.searchMemories] and
- *   reused for every agent step in this pipeline run.
- *
- * ### Step 4 – COORDINATOR invocation
- * [AgentManager.getCoordinatorAgent] supplies the COORDINATOR agent entity.
- * [FallbackLLMClient.sendMessage] is called with the assembled context.  The
- * failover chain (Groq → OpenRouter → GitHub Models → Cloudflare) is
- * transparent to the orchestrator.
- *
- * ### Step 5 – Sub-agent routing
- * The COORDINATOR's response text is scanned for Portuguese/English routing
- * keywords.  Matching specialised agents are invoked sequentially via the
- * same [FallbackLLMClient].
- *
- * ### Step 6 – Audit cross-check (optional)
- * If `settings.auditEnabled == true`, the AUDITOR agent reviews the
- * aggregated response.
- *
- * ### Step 7 – Persist agent responses
- * Each agent response is saved to [MessageDao].  Every step is logged to
- * [AuditLogDao] via [AuditLogger] using the same [correlationId].
- *
- * @param context        Android [Context] used for DB access and notifications.
- * @param agentManager   Provides CRUD operations and lookup for agent entities.
- * @param auditLogger    Utility for writing structured audit log entries.
- * @param conversationId UUID string identifying the current conversation.
+ * The returned memories are injected as a `role="system"` block into every
+ * downstream agent LLM call so the model treats them as authoritative
+ * background knowledge.
  */
 class AgentOrchestrator(
     private val context: Context,
-    private val agentManager: AgentManager,
-    private val auditLogger: AuditLogger,
-    private val conversationId: String = UUID.randomUUID().toString()
+    private val messageDao: MessageDao,
+    private val memoryDao: MemoryDao,
+    private val agentDao: AgentDao,
+    private val auditLogDao: AuditLogDao,
+    private val settingsDao: SettingsDao,
+    private val auditLogger: AuditLogger
 ) {
 
     companion object {
-        const val TAG = "AgentOrchestrator"
-        const val MAX_CONTEXT_MESSAGES = 10
+        private const val TAG = "AgentOrchestrator"
 
-        // Sub-agent routing keyword lists
-        val RESEARCHER_KEYWORDS = listOf(
-            "pesquisa", "busca", "pesquisar", "buscar",
-            "research", "search", "find", "lookup"
+        /** Maximum number of recent messages included in short-term context. */
+        private const val MAX_CONTEXT_MESSAGES = 10
+
+        /** Maximum memories injected into each agent prompt (Stage 2). */
+        private const val MAX_MEMORY_SNIPPETS = 5
+
+        /** Intent confidence threshold above which a specialist agent is preferred. */
+        private const val INTENT_THRESHOLD = 0.6f
+
+        private val RESEARCH_KEYWORDS = setOf(
+            "pesquisa", "busca", "encontra", "research", "find", "search", "procura"
         )
-        val PLANNER_KEYWORDS = listOf(
-            "plano", "planejamento", "planejar", "organizar",
-            "plan", "organize", "schedule", "breakdown"
+        private val PLANNING_KEYWORDS = setOf(
+            "plano", "planejamento", "plan", "planning", "steps", "strategy", "etapas"
         )
-        val EXECUTOR_KEYWORDS = listOf(
-            "executa", "implementa", "executar", "implementar",
-            "execute", "implement", "run", "perform"
-        )
-        val COMMUNICATION_KEYWORDS = listOf(
-            "comunica", "envia", "comunicar", "enviar",
-            "communicate", "send", "notify", "message"
+        private val EXECUTION_KEYWORDS = setOf(
+            "execute", "executar", "fazer", "run", "create", "build", "cria", "implement"
         )
     }
 
-    // Nullable – pipeline short-circuits if null (no API key configured)
-    private var llmClient: LLMClient? = null
-    private var fallbackClient: FallbackLLMClient? = null
+    // ------------------------------------------------------------------
+    // State
+    // ------------------------------------------------------------------
 
+    private var fallbackLLMClient: FallbackLLMClient? = null
     private lateinit var conversationProgrammer: ConversationAgentProgrammer
+    private lateinit var agentManager: AgentManager
 
-    private val db by lazy { AppDatabase.getDatabase(context) }
-    private val notifier by lazy { ProviderExhaustedNotifier(context) }
+    /** Lazily created [MemorySearchEngine] — shares [memoryDao] with this class. */
+    private val memorySearchEngine: MemorySearchEngine by lazy {
+        MemorySearchEngine(memoryDao = memoryDao, context = context)
+    }
 
-    // ---------------------------------------------------------------------------
+    // ------------------------------------------------------------------
     // Initialisation
-    // ---------------------------------------------------------------------------
+    // ------------------------------------------------------------------
 
     /**
-     * Initialises the [LLMClient] and [FallbackLLMClient] from persisted
-     * settings.  Must be called before [processUserMessage].
-     *
-     * If the settings contain no API key, [llmClient] remains `null` and the
-     * pipeline will return an error result on every invocation.
-     *
-     * @param settings Current [com.agente.autonomo.data.entity.Settings] row.
+     * Initialise the LLM client from persisted settings.  Must be called
+     * before [processUserMessage].  Safe to call multiple times — each call
+     * constructs a fresh [FallbackLLMClient] so API-key / provider changes
+     * are picked up immediately.
      */
-    fun initialize(settings: com.agente.autonomo.data.entity.Settings) {
+    suspend fun initializeLLM() {
+        val settings = settingsDao.getSettingsSync() ?: return
         if (settings.apiKey.isBlank()) {
-            Log.w(TAG, "No API key configured – LLM pipeline disabled")
+            Log.w(TAG, "API key is blank — LLM calls will fail")
             return
         }
-        llmClient = LLMClient(settings)
-
-        val healthRepo = ProviderHealthRepository(db.providerHealthDao())
-        val healthChecker = ProviderHealthChecker()
-
-        fallbackClient = FallbackLLMClient(
+        fallbackLLMClient = FallbackLLMClient(
             baseSettings = settings,
-            healthRepository = healthRepo,
-            healthChecker = healthChecker,
+            healthRepository = com.agente.autonomo.api.ProviderHealthRepository(
+                providerHealthDao = com.agente.autonomo.data.database.AppDatabase
+                    .getDatabase(context).providerHealthDao()
+            ),
+            healthChecker = com.agente.autonomo.api.ProviderHealthChecker(),
             onAllProvidersFailed = {
-                Log.e(TAG, "All providers exhausted – posting notification")
-                notifier.notifyAllProvidersExhausted()
+                Log.e(TAG, "All LLM providers exhausted for this request")
             }
         )
-
-        conversationProgrammer = ConversationAgentProgrammer(
-            agentManager = agentManager,
-            auditLogger = auditLogger
-        )
-        Log.i(TAG, "AgentOrchestrator initialised with provider: ${settings.apiProvider}")
+        agentManager = AgentManager(agentDao, auditLogger)
+        conversationProgrammer = ConversationAgentProgrammer(agentManager, memoryDao)
+        Log.i(TAG, "LLM client initialised (provider=${settings.apiProvider})")
     }
 
-    // ---------------------------------------------------------------------------
-    // Main pipeline entry point
-    // ---------------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Pipeline entry point
+    // ------------------------------------------------------------------
 
     /**
-     * Processes a single user message through the full multi-agent pipeline.
+     * Process a user message through the full multi-agent pipeline.
      *
-     * See the class-level KDoc for a detailed description of each step.
-     *
-     * @param userMessage    Raw text entered by the user.
-     * @param conversationId Optional override for the conversation UUID;
-     *                       defaults to the instance-level [conversationId].
-     * @return [Result.success] containing the final agent response string, or
-     *         [Result.failure] with a descriptive exception.
+     * @param userMessage     Raw text typed by the user.
+     * @param conversationId  Scopes short-term context and memory writes.
+     * @return [Result.success] with the final agent response string, or
+     *         [Result.failure] with a descriptive error.
      */
     suspend fun processUserMessage(
         userMessage: String,
-        conversationId: String = this.conversationId
+        conversationId: String
     ): Result<String> = withContext(Dispatchers.IO) {
-
-        // ----------------------------------------------------------------
-        // Step 0 – Guard: require FallbackLLMClient (implies LLMClient too)
-        // ----------------------------------------------------------------
-        val client = fallbackClient ?: run {
-            Log.w(TAG, "FallbackLLMClient not initialised – aborting pipeline")
-            return@withContext Result.failure(
-                IllegalStateException(
-                    "LLM client not configured. Please set an API key in Settings."
-                )
-            )
-        }
-
         val correlationId = UUID.randomUUID().toString()
         Log.d(TAG, "Pipeline start [correlationId=$correlationId]")
 
-        // ----------------------------------------------------------------
-        // Step 1 – Command intercept
-        // ----------------------------------------------------------------
-        if (::conversationProgrammer.isInitialized) {
-            val programmerResult =
-                conversationProgrammer.processMessage(userMessage, conversationId)
-            if (programmerResult != null) {
-                Log.d(TAG, "Command handled by ConversationAgentProgrammer")
-                return@withContext programmerResult
-            }
-        }
-
-        // ----------------------------------------------------------------
-        // Step 2 – Persist user message
-        // ----------------------------------------------------------------
-        saveUserMessage(userMessage, conversationId)
-
-        // ----------------------------------------------------------------
-        // Step 3 – Context assembly
-        // ----------------------------------------------------------------
-        val contextMessages = getConversationContext(conversationId)
-        val memories = getRelevantMemories(userMessage)
-
-        // ----------------------------------------------------------------
-        // Step 4 – COORDINATOR invocation via failover chain
-        // ----------------------------------------------------------------
-        val coordinatorAgent = agentManager.getCoordinatorAgent()
-            ?: return@withContext Result.failure(
-                IllegalStateException("No COORDINATOR agent found in database")
-            )
-
-        auditLogger.logAction(
-            type = com.agente.autonomo.data.entity.AuditLogType.AGENT_ACTION,
-            action = "COORDINATOR invoked",
-            agentId = coordinatorAgent.id,
-            agentName = coordinatorAgent.name,
-            details = "correlationId=$correlationId",
-            correlationId = correlationId
-        )
-
-        val coordinatorMessages = buildAgentMessages(
-            agent = coordinatorAgent,
-            userMessage = userMessage,
-            contextMessages = contextMessages,
-            memories = memories
-        )
-
-        val coordinatorResult = client.sendMessage(coordinatorMessages)
-        if (coordinatorResult.isFailure) {
-            val err = coordinatorResult.exceptionOrNull()?.message ?: "Unknown error"
-            Log.e(TAG, "COORDINATOR failed: $err")
-            auditLogger.logAction(
-                type = com.agente.autonomo.data.entity.AuditLogType.ERROR,
-                action = "COORDINATOR failed",
-                agentId = coordinatorAgent.id,
-                agentName = coordinatorAgent.name,
-                details = "error=$err correlationId=$correlationId",
-                correlationId = correlationId
-            )
-            return@withContext Result.failure(
-                Exception("COORDINATOR agent failed: $err")
-            )
-        }
-
-        val coordinatorResponse = coordinatorResult.getOrThrow()
-            .choices.firstOrNull()?.message?.content
-            ?: return@withContext Result.failure(
-                Exception("Empty response from COORDINATOR")
-            )
-
-        saveAgentMessage(coordinatorResponse, coordinatorAgent.id, conversationId)
-        auditLogger.logAction(
-            type = com.agente.autonomo.data.entity.AuditLogType.AGENT_ACTION,
-            action = "COORDINATOR responded",
-            agentId = coordinatorAgent.id,
-            agentName = coordinatorAgent.name,
-            details = "length=${coordinatorResponse.length} correlationId=$correlationId",
-            correlationId = correlationId
-        )
-
-        // ----------------------------------------------------------------
-        // Step 5 – Sub-agent routing
-        // ----------------------------------------------------------------
-        val subAgentResponses = routeToSubAgents(
-            coordinatorResponse = coordinatorResponse,
-            userMessage = userMessage,
-            contextMessages = contextMessages,
-            memories = memories,
-            correlationId = correlationId,
-            conversationId = conversationId,
-            client = client
-        )
-
-        val finalResponse = if (subAgentResponses.isEmpty()) {
-            coordinatorResponse
-        } else {
-            subAgentResponses.joinToString("\n\n")
-        }
-
-        // ----------------------------------------------------------------
-        // Step 6 – Audit cross-check (optional)
-        // ----------------------------------------------------------------
-        val settings = db.settingsDao().getSettingsSync()
-        if (settings?.auditEnabled == true) {
-            runAuditStep(
-                response = finalResponse,
-                userMessage = userMessage,
-                contextMessages = contextMessages,
-                memories = memories,
-                correlationId = correlationId,
-                conversationId = conversationId,
-                client = client
-            )
-        }
-
-        Log.i(TAG, "Pipeline complete [correlationId=$correlationId]")
-        Result.success(finalResponse)
-    }
-
-    // ---------------------------------------------------------------------------
-    // Sub-agent routing
-    // ---------------------------------------------------------------------------
-
-    /**
-     * Scans [coordinatorResponse] for routing keywords and invokes the
-     * appropriate specialised agents via [client].
-     *
-     * Routing is additive: multiple sub-agents may be triggered by a single
-     * coordinator response.
-     *
-     * @param coordinatorResponse The COORDINATOR's response text.
-     * @param userMessage         Original user input.
-     * @param contextMessages     Recent conversation messages.
-     * @param memories            Pre-fetched relevant memories.
-     * @param correlationId       Shared trace ID for this pipeline run.
-     * @param conversationId      Active conversation ID.
-     * @param client              [FallbackLLMClient] to use for sub-agent calls.
-     * @return List of response strings from each invoked sub-agent.
-     */
-    private suspend fun routeToSubAgents(
-        coordinatorResponse: String,
-        userMessage: String,
-        contextMessages: List<com.agente.autonomo.data.entity.Message>,
-        memories: List<Memory>,
-        correlationId: String,
-        conversationId: String,
-        client: FallbackLLMClient
-    ): List<String> {
-        val lower = coordinatorResponse.lowercase()
-        val responses = mutableListOf<String>()
-
-        suspend fun trySubAgent(keywords: List<String>, agentType: AgentType) {
-            if (keywords.any { lower.contains(it) }) {
-                val agent = agentManager.getAgentByType(agentType) ?: return
-                val msgs = buildAgentMessages(agent, userMessage, contextMessages, memories)
-                auditLogger.logAction(
-                    type = com.agente.autonomo.data.entity.AuditLogType.AGENT_ACTION,
-                    action = "${agentType.name} invoked",
-                    agentId = agent.id,
-                    agentName = agent.name,
-                    details = "correlationId=$correlationId",
-                    correlationId = correlationId
-                )
-                val result = client.sendMessage(msgs)
-                result.onSuccess { resp ->
-                    val text = resp.choices.firstOrNull()?.message?.content ?: return
-                    saveAgentMessage(text, agent.id, conversationId)
+        try {
+            // ── Stage 0: Intercept special commands ───────────────────────────
+            if (::conversationProgrammer.isInitialized) {
+                val cmdResult = conversationProgrammer.processMessage(userMessage)
+                if (cmdResult.isCommand) {
+                    saveUserMessage(userMessage, conversationId)
+                    saveAgentMessage(cmdResult.response, conversationId, agentId = null)
                     auditLogger.logAction(
-                        type = com.agente.autonomo.data.entity.AuditLogType.AGENT_ACTION,
-                        action = "${agentType.name} responded",
-                        agentId = agent.id,
-                        agentName = agent.name,
-                        details = "length=${text.length} correlationId=$correlationId",
+                        type = AuditLog.AuditLogType.SYSTEM,
+                        action = "command_intercepted",
+                        details = userMessage,
                         correlationId = correlationId
                     )
-                    responses += text
-                }.onFailure { err ->
-                    Log.w(TAG, "${agentType.name} failed: ${err.message}")
+                    return@withContext Result.success(cmdResult.response)
                 }
             }
-        }
 
-        trySubAgent(RESEARCHER_KEYWORDS, AgentType.RESEARCHER)
-        trySubAgent(PLANNER_KEYWORDS, AgentType.PLANNER)
-        trySubAgent(EXECUTOR_KEYWORDS, AgentType.EXECUTOR)
-        trySubAgent(COMMUNICATION_KEYWORDS, AgentType.COMMUNICATION)
+            // ── Stage 1: Persist user message + fetch short-term context ──────
+            saveUserMessage(userMessage, conversationId)
+            val recentMessages = messageDao.getRecentMessages(conversationId, MAX_CONTEXT_MESSAGES)
+            val historyMessages = recentMessages.map { msg ->
+                Message(
+                    role = when (msg.senderType) {
+                        SenderType.USER -> "user"
+                        SenderType.AGENT -> "assistant"
+                        else -> "system"
+                    },
+                    content = msg.content
+                )
+            }
 
-        return responses
-    }
+            // ── Stage 2: Semantic memory retrieval (long-term context) ────────
+            // Uses vector cosine-similarity ranking; falls back to keyword LIKE
+            // for legacy rows without embeddings.
+            val memorySnippets: List<Memory> = getRelevantMemories(userMessage)
+            val memorySystemBlock: Message? = if (memorySnippets.isNotEmpty()) {
+                val memoryText = memorySnippets.joinToString("\n") { m ->
+                    "[Memory] ${m.key}: ${m.value}"
+                }
+                Message(role = "system", content = "Relevant memories:\n$memoryText")
+            } else null
 
-    // ---------------------------------------------------------------------------
-    // Audit step
-    // ---------------------------------------------------------------------------
+            // ── Stage 3: Classify intent ──────────────────────────────────────
+            val (intentLabel, intentScore) = classifyIntent(userMessage)
+            Log.d(TAG, "Stage 3 — intent=$intentLabel score=$intentScore")
 
-    /**
-     * Invokes the AUDITOR agent to cross-check [response] when
-     * `settings.auditEnabled` is true.
-     *
-     * The AUDITOR's output is saved to [MessageDao] and logged but does not
-     * replace the final response returned to the UI.
-     *
-     * @param response        The aggregated response to audit.
-     * @param userMessage     Original user input.
-     * @param contextMessages Recent conversation messages.
-     * @param memories        Pre-fetched relevant memories.
-     * @param correlationId   Shared trace ID for this pipeline run.
-     * @param conversationId  Active conversation ID.
-     * @param client          [FallbackLLMClient] to use for the audit call.
-     */
-    private suspend fun runAuditStep(
-        response: String,
-        userMessage: String,
-        contextMessages: List<com.agente.autonomo.data.entity.Message>,
-        memories: List<Memory>,
-        correlationId: String,
-        conversationId: String,
-        client: FallbackLLMClient
-    ) {
-        val auditorAgent = agentManager.getAgentByType(AgentType.AUDITOR) ?: return
-        val auditUserMessage = "Please audit the following response:\n\n$response"
-        val msgs = buildAgentMessages(
-            auditorAgent, auditUserMessage, contextMessages, memories
-        )
-        auditLogger.logAction(
-            type = com.agente.autonomo.data.entity.AuditLogType.AGENT_ACTION,
-            action = "AUDITOR invoked",
-            agentId = auditorAgent.id,
-            agentName = auditorAgent.name,
-            details = "correlationId=$correlationId",
-            correlationId = correlationId
-        )
-        client.sendMessage(msgs).onSuccess { resp ->
-            val text = resp.choices.firstOrNull()?.message?.content ?: return
-            saveAgentMessage(text, auditorAgent.id, conversationId)
+            // ── Stage 4: Route and execute agents ─────────────────────────────
+            val client = fallbackLLMClient
+                ?: return@withContext Result.failure(Exception("LLM client não inicializado"))
+
+            val coordinator = agentDao.getAgentsByType("COORDINATOR").firstOrNull()
+                ?: return@withContext Result.failure(Exception("Agente coordenador não encontrado"))
+
+            // Build routing payload for coordinator
+            val routingMessages = buildList {
+                add(Message(role = "system", content = coordinator.systemPrompt))
+                memorySystemBlock?.let { add(it) }
+                addAll(historyMessages)
+                add(Message(
+                    role = "user",
+                    content = buildRoutingPrompt(userMessage, intentLabel, intentScore)
+                ))
+            }
+
+            val routingResponse = client.sendMessage(routingMessages).getOrNull()
+                ?: return@withContext Result.failure(Exception("Falha na decisão de agentes"))
+
             auditLogger.logAction(
-                type = com.agente.autonomo.data.entity.AuditLogType.AGENT_ACTION,
-                action = "AUDITOR responded",
-                agentId = auditorAgent.id,
-                agentName = auditorAgent.name,
-                details = "length=${text.length} correlationId=$correlationId",
+                type = AuditLog.AuditLogType.AGENT,
+                action = "coordinator_routing",
+                agentId = coordinator.id,
+                agentName = coordinator.name,
+                details = routingResponse.choices.firstOrNull()?.message?.content.orEmpty(),
                 correlationId = correlationId
             )
-        }.onFailure { err ->
-            Log.w(TAG, "AUDITOR failed: ${err.message}")
+
+            // Determine which agent IDs were selected by the coordinator
+            val agentDecision = parseAgentDecision(
+                routingResponse.choices.firstOrNull()?.message?.content.orEmpty(),
+                coordinator
+            )
+
+            // Execute each selected agent sequentially
+            val agentResponses = mutableListOf<String>()
+            for (agentId in agentDecision.selectedAgents) {
+                val agent = agentDao.getAgentById(agentId) ?: continue
+                val agentMessages = buildList {
+                    add(Message(role = "system", content = agent.systemPrompt))
+                    memorySystemBlock?.let { add(it) }  // inject long-term memory
+                    addAll(historyMessages)              // inject short-term context
+                    add(Message(role = "user", content = userMessage))
+                }
+                val agentResponse = client.sendMessage(
+                    messages = agentMessages
+                ).getOrNull() ?: continue
+
+                val text = agentResponse.choices.firstOrNull()?.message?.content ?: continue
+                agentResponses.add(text)
+
+                agentManager.recordAgentUsage(agentId)
+                auditLogger.logAction(
+                    type = AuditLog.AuditLogType.AGENT,
+                    action = "agent_response",
+                    agentId = agent.id,
+                    agentName = agent.name,
+                    details = text,
+                    correlationId = correlationId
+                )
+            }
+
+            if (agentResponses.isEmpty()) {
+                return@withContext Result.failure(Exception("Nenhum agente conseguiu responder"))
+            }
+
+            val finalResponse = agentResponses.joinToString("\n\n---\n\n")
+
+            // ── Stage 5: Optional cross-audit ─────────────────────────────────
+            val settings = settingsDao.getSettingsSync()
+            if (settings?.auditEnabled == true) {
+                val auditor = agentDao.getAgentsByType("AUDITOR").firstOrNull()
+                if (auditor != null) {
+                    val auditMessages = listOf(
+                        Message(role = "system", content = auditor.systemPrompt),
+                        Message(
+                            role = "user",
+                            content = "Audite a seguinte resposta:\n$finalResponse"
+                        )
+                    )
+                    val auditResponse = client.sendMessage(auditMessages).getOrNull()
+                    val auditText = auditResponse?.choices?.firstOrNull()?.message?.content
+                    if (auditText?.contains("REPROVADO") == true) {
+                        Log.w(TAG, "[correlationId=$correlationId] Audit REPROVADO: $auditText")
+                    }
+                    auditLogger.logAction(
+                        type = AuditLog.AuditLogType.SYSTEM,
+                        action = "cross_audit",
+                        details = auditText.orEmpty(),
+                        correlationId = correlationId
+                    )
+                }
+            }
+
+            // ── Stage 6: Persist agent response ───────────────────────────────
+            saveAgentMessage(finalResponse, conversationId, agentId = coordinator.id)
+
+            // ── Stage 7: Optional memory update ───────────────────────────────
+            if (settings?.memoryEnabled == true) {
+                updateMemory(
+                    userMessage = userMessage,
+                    response = finalResponse,
+                    conversationId = conversationId
+                )
+            }
+
+            Log.d(TAG, "Pipeline complete [correlationId=$correlationId]")
+            Result.success(finalResponse)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Pipeline error [correlationId=$correlationId]", e)
+            Result.failure(e)
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Stage 2 helper — semantic memory retrieval
+    // ------------------------------------------------------------------
 
-    private fun buildAgentMessages(
-        agent: Agent,
+    /**
+     * Retrieves up to [MAX_MEMORY_SNIPPETS] semantically relevant memories
+     * for [query] using [MemorySearchEngine].
+     *
+     * This method is always non-throwing: any error from the search engine
+     * or DAO is caught and an empty list is returned, preserving pipeline
+     * continuity.  The agent system operates without memory context rather
+     * than failing hard.
+     */
+    private suspend fun getRelevantMemories(query: String): List<Memory> {
+        return try {
+            memorySearchEngine.search(query = query, topK = MAX_MEMORY_SNIPPETS)
+        } catch (e: Exception) {
+            Log.w(TAG, "getRelevantMemories failed — returning empty list", e)
+            emptyList()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 3 helper — intent classification
+    // ------------------------------------------------------------------
+
+    private fun classifyIntent(text: String): Pair<String?, Float?> {
+        val tokens = text.lowercase().split(" ")
+        fun score(keywords: Set<String>): Float {
+            val matched = tokens.count { it in keywords }.toFloat()
+            return (matched / tokens.size.coerceAtLeast(1) * 5f).coerceAtMost(1f)
+        }
+
+        val scores = mapOf(
+            "research" to score(RESEARCH_KEYWORDS),
+            "planning" to score(PLANNING_KEYWORDS),
+            "execution" to score(EXECUTION_KEYWORDS)
+        )
+        val best = scores.maxByOrNull { it.value } ?: return null to null
+        return if (best.value > INTENT_THRESHOLD) best.key to best.value else null to null
+    }
+
+    // ------------------------------------------------------------------
+    // Routing helpers
+    // ------------------------------------------------------------------
+
+    private fun buildRoutingPrompt(
         userMessage: String,
-        contextMessages: List<com.agente.autonomo.data.entity.Message>,
-        memories: List<Memory>
-    ): List<Message> {
-        val messages = mutableListOf<Message>()
+        intentLabel: String?,
+        intentScore: Float?
+    ): String {
+        val intentHint = if (intentLabel != null && intentScore != null && intentScore > INTENT_THRESHOLD) {
+            "\nIntent classificado: $intentLabel (score=$intentScore)"
+        } else ""
+        return """Mensagem do usuário: $userMessage$intentHint
 
-        // System prompt
-        val systemContent = buildString {
-            append(agent.systemPrompt)
-            if (memories.isNotEmpty()) {
-                append("\n\n[Relevant memories]\n")
-                memories.forEach { mem -> append("- ${mem.key}: ${mem.value}\n") }
-            }
-        }
-        messages += Message(role = "system", content = systemContent)
-
-        // Recent conversation context
-        contextMessages.takeLast(MAX_CONTEXT_MESSAGES).forEach { msg ->
-            val role = when (msg.senderType) {
-                SenderType.USER -> "user"
-                else -> "assistant"
-            }
-            messages += Message(role = role, content = msg.content)
-        }
-
-        // Current user message
-        messages += Message(role = "user", content = userMessage)
-
-        return messages
+Responda com JSON no formato:
+{"selectedAgents":["agentId1"],"reasoning":"...","executionOrder":"sequential"}"""
     }
+
+    private data class AgentDecision(
+        val selectedAgents: List<String>,
+        val reasoning: String,
+        val executionOrder: String
+    )
+
+    private fun parseAgentDecision(
+        text: String,
+        coordinator: com.agente.autonomo.data.entity.Agent
+    ): AgentDecision {
+        return try {
+            val gson = com.google.gson.Gson()
+            gson.fromJson(text, AgentDecision::class.java)
+                ?: AgentDecision(listOf(coordinator.id), "fallback", "sequential")
+        } catch (_: Exception) {
+            AgentDecision(listOf(coordinator.id), "parse_error", "sequential")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence helpers
+    // ------------------------------------------------------------------
 
     private suspend fun saveUserMessage(content: String, conversationId: String) {
-        db.messageDao().insert(
-            com.agente.autonomo.data.entity.Message(
-                conversationId = conversationId,
-                agentId = null,
-                senderType = SenderType.USER,
-                content = content,
-                timestamp = java.util.Date()
-            )
+        val msg = com.agente.autonomo.data.entity.Message(
+            conversationId = conversationId,
+            agentId = null,
+            senderType = SenderType.USER,
+            content = content,
+            timestamp = Date()
         )
+        messageDao.insertMessage(msg)
     }
 
     private suspend fun saveAgentMessage(
         content: String,
-        agentId: String?,
+        conversationId: String,
+        agentId: String?
+    ) {
+        val msg = com.agente.autonomo.data.entity.Message(
+            conversationId = conversationId,
+            agentId = agentId,
+            senderType = SenderType.AGENT,
+            content = content,
+            timestamp = Date()
+        )
+        messageDao.insertMessage(msg)
+    }
+
+    /**
+     * Stage 7: Write a CONTEXT memory for this conversation turn.
+     *
+     * Also computes and persists an embedding for the new memory row so
+     * future searches benefit from vector similarity immediately without
+     * waiting for the back-fill worker.
+     */
+    private suspend fun updateMemory(
+        userMessage: String,
+        response: String,
         conversationId: String
     ) {
-        db.messageDao().insert(
-            com.agente.autonomo.data.entity.Message(
+        try {
+            val memoryText = "Usuário: $userMessage\nResposta: ${response.take(200)}"
+            val memory = Memory(
+                id = UUID.randomUUID().toString(),
+                type = Memory.MemoryType.CONTEXT,
+                key = "conversation_${conversationId}_${System.currentTimeMillis()}",
+                value = memoryText,
                 conversationId = conversationId,
-                agentId = agentId,
-                senderType = SenderType.AGENT,
-                content = content,
-                timestamp = java.util.Date()
+                importance = 5
             )
-        )
-    }
-
-    private suspend fun getConversationContext(
-        conversationId: String
-    ): List<com.agente.autonomo.data.entity.Message> {
-        return db.messageDao().getRecentMessages(
-            conversationId = conversationId,
-            limit = MAX_CONTEXT_MESSAGES
-        )
-    }
-
-    private suspend fun getRelevantMemories(query: String): List<Memory> {
-        return db.memoryDao().searchMemories(query)
+            // Eagerly embed so the row is immediately retrievable by vector search
+            val engine = try {
+                EmbeddingEngine.getInstance(context)
+            } catch (e: Exception) {
+                Log.w(TAG, "EmbeddingEngine unavailable during memory write", e)
+                null
+            }
+            val embeddedMemory = if (engine != null) {
+                val vec = engine.embed(memory.key + ": " + memory.value)
+                val blob = EmbeddingEngine.floatArrayToBytes(vec)
+                memory.copy(embedding = blob)
+            } else {
+                memory
+            }
+            memoryDao.insertMemory(embeddedMemory)
+        } catch (e: Exception) {
+            // Stage 7 is best-effort — never propagate to caller
+            Log.w(TAG, "updateMemory failed (non-fatal)", e)
+        }
     }
 }

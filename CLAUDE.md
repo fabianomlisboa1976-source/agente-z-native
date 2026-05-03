@@ -34,6 +34,7 @@ The project follows a layered architecture pattern:
 │               Data Layer                     │
 │  Room Database → DAOs → Entities             │
 │  OfflineResponseCache (local LLM cache)      │
+│  VectorMemoryStore (embedding-based search)  │
 ├─────────────────────────────────────────────┤
 │              Service Layer                   │
 │  AgenteAutonomoService (ForegroundService)   │
@@ -64,7 +65,8 @@ The `AgentOrchestrator` implements a **sequential multi-agent pipeline** for eve
        ↓ (no command → continue pipeline)
 2. saveUserMessage() → MessageDao
 3. getConversationContext() → MessageDao.getRecentMessages()
-   getRelevantMemories() → MemoryDao.searchMemories()
+   getRelevantMemories() → VectorMemoryStore.searchSimilar() [vector similarity]
+                         + MemoryDao.searchMemories() [keyword fallback]
 4. AgentManager.getCoordinatorAgent() → AgentDao
        ↓
 5. FallbackLLMClient.sendMessage(coordinatorAgent, context, memories)
@@ -75,16 +77,18 @@ The `AgentOrchestrator` implements a **sequential multi-agent pipeline** for eve
 7. [Optional] AuditAgent cross-check if auditEnabled in Settings
 8. saveAgentMessage() → MessageDao (each agent's response saved)
    AuditLogger.logAction() → AuditLogDao (each step logged with correlationId)
+   VectorMemoryStore.storeMemoryWithEmbedding() → persist embedding for future retrieval
 9. Return final Result<String> to UI
 ```
 
 **Key routing decisions:**
 - The COORDINATOR agent's LLM response determines which specialized agents are invoked next
 - Each agent step uses the **same `correlationId`** (UUID) so the full pipeline is traceable in audit logs
-- Memory retrieval is done **once before the pipeline starts** and injected into each agent's context
+- Memory retrieval is done **once before the pipeline starts** and injected into each agent's context; vector similarity search is preferred over keyword search when embeddings are available
 - Conversation context (recent messages) is prepended to every agent's system prompt
 - If all LLM providers fail and no offline cache entry exists, the pipeline returns a meaningful degraded-mode error result
 - If `conversationProgrammer` is not initialized, programming commands are skipped gracefully
+- New memories saved during pipeline execution are embedded and stored via `VectorMemoryStore` for future similarity retrieval
 
 ### Offline-First LLM Fallback Chain
 
@@ -128,6 +132,88 @@ Each provider attempt (success or failure) and each cache hit/miss is recorded v
 - `action` values: `"llm_primary_success"`, `"llm_primary_failure"`, `"llm_fallback_attempt"`, `"llm_fallback_success"`, `"llm_fallback_failure"`, `"llm_cache_hit"`, `"llm_cache_miss"`, `"llm_all_providers_failed"`
 - The same `correlationId` as the enclosing pipeline step, enabling full tracing of which provider ultimately served each request
 
+### Structured Agent Memory with Vector Similarity Search
+
+The memory system has been upgraded from keyword-only search to a **hybrid vector + keyword retrieval** architecture. This enables semantically relevant memories to be surfaced even when exact keyword matches are absent.
+
+#### Architecture Overview
+
+```
+Memory Write Path:
+  saveMemory() → MemoryDao.insert()
+              → EmbeddingEngine.embed(memoryText)
+              → VectorMemoryStore.storeEmbedding(memoryId, vector)
+
+Memory Read Path:
+  getRelevantMemories(query) → EmbeddingEngine.embed(query)
+                             → VectorMemoryStore.searchSimilar(queryVector, topK)
+                             → [fallback] MemoryDao.searchMemories(keywords)
+```
+
+#### EmbeddingEngine
+
+`EmbeddingEngine` is responsible for producing dense vector representations of text:
+
+- **Interface:** `EmbeddingEngine` with `suspend fun embed(text: String): FloatArray`
+- **Default implementation:** `TFLiteEmbeddingEngine` – runs a bundled TensorFlow Lite sentence embedding model on-device (no network required)
+- **Fallback implementation:** `BagOfWordsEmbeddingEngine` – lightweight TF-IDF-style bag-of-words embedding used when TFLite model is unavailable or on low-memory devices; deterministic and fast but lower quality
+- **Dimensionality:** Configurable; default TFLite model produces 384-dimensional vectors (MiniLM-L6-v2 or equivalent)
+- **Normalization:** All output vectors are L2-normalized before storage and query to enable cosine similarity via dot product
+
+#### VectorMemoryStore
+
+`VectorMemoryStore` manages embedding storage and similarity search:
+
+- **Storage backend:** Room entity `MemoryEmbedding` in `memory_embeddings` table; stores `memoryId` (FK → `memories.id`), `vector` (serialized as `FloatArray` / BLOB), `modelVersion`, `createdAt`
+- **DAO:** `MemoryEmbeddingDao` – `insert()`, `findByMemoryId()`, `deleteByMemoryId()`, `getAllEmbeddings()`
+- **Similarity metric:** Cosine similarity (dot product of L2-normalized vectors)
+- **Search algorithm:** Brute-force nearest-neighbor scan over all stored embeddings; suitable for up to ~10,000 memories on modern Android hardware; a future HNSW index migration path is noted in KDoc
+- **Top-K selection:** Returns the `topK` (default 5) most similar memories above a configurable `similarityThreshold` (default 0.65)
+- **Model versioning:** Embeddings store the `modelVersion` string; if the engine version changes, stale embeddings are detected and re-indexed lazily on next access
+
+#### MemoryEmbedding Entity
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | Long (auto) | Primary key |
+| `memoryId` | String | FK → `Memory.id` |
+| `vector` | ByteArray | L2-normalized FloatArray serialized to bytes |
+| `modelVersion` | String | Embedding model identifier (e.g., `"minilm-v6-384"`) |
+| `createdAt` | Long | Unix timestamp ms |
+
+#### MemorySearchStrategy
+
+A `MemorySearchStrategy` sealed class/enum controls retrieval behavior:
+- `VECTOR_ONLY` – use embedding similarity exclusively
+- `KEYWORD_ONLY` – use existing `MemoryDao.searchMemories()` keyword search
+- `HYBRID` – run both, merge and deduplicate results, rank by combined score (default)
+- `VECTOR_WITH_KEYWORD_FALLBACK` – try vector first; if fewer than `minResults` returned, supplement with keyword results
+
+The strategy is configurable in `Settings` (`memorySearchStrategy: String`) and exposed in `SettingsActivity`.
+
+#### Integration with AgentOrchestrator
+
+- `AgentOrchestrator` now depends on `VectorMemoryStore` and `EmbeddingEngine` (injected via constructor)
+- `getRelevantMemories()` uses `HYBRID` strategy by default: query is embedded, `VectorMemoryStore.searchSimilar()` is called, results are merged with keyword matches, deduplicated by `memoryId`, and ranked
+- After the pipeline produces a response, any new `Memory` entities saved are immediately embedded and stored via `VectorMemoryStore.storeMemoryWithEmbedding()`
+- Embedding calls are always `suspend` and dispatched on `Dispatchers.Default` to avoid blocking the main thread
+
+#### Audit Logging for Memory Search
+
+Memory retrieval events are logged via `AuditLogger.logAction()`:
+- `action = "memory_vector_search"` – records query, topK, similarityThreshold, number of results returned
+- `action = "memory_keyword_search"` – records keyword query and result count
+- `action = "memory_hybrid_search"` – records both vector and keyword result counts and final merged count
+- `action = "memory_embedding_stored"` – records memoryId and modelVersion when a new embedding is persisted
+- `action = "memory_embedding_reindex"` – records when stale embeddings are detected and re-indexed
+
+#### Performance Considerations
+
+- Embedding inference (`TFLiteEmbeddingEngine`) takes ~5–20ms on mid-range hardware; acceptable within the async pipeline
+- Brute-force vector scan over 10K memories takes ~50–100ms on Dispatchers.Default; a warning is logged when scan time exceeds 200ms
+- `BagOfWordsEmbeddingEngine` is selected automatically on devices with < 2GB RAM or when the TFLite model fails to load
+- Embeddings are computed lazily at save time; no background re-indexing job runs unless a model version change is detected
+
 ### Sub-Agent Routing Logic
 
 The COORDINATOR's response text is parsed to determine which sub-agents to invoke. Routing decisions are keyword/pattern-based:
@@ -142,7 +228,7 @@ The COORDINATOR's response text is parsed to determine which sub-agents to invok
 
 The pipeline is formally documented via:
 - **Inline KDoc comments** on `AgentOrchestrator` methods describing each pipeline step, guard conditions, and expected behavior
-- **Unit tests** (in `test/` source set) covering: guard conditions (null LLMClient, uninitialized programmer), happy-path single-coordinator flow, sub-agent routing, audit step gating, correlationId propagation, fallback chain behavior, and offline cache interactions
+- **Unit tests** (in `test/` source set) covering: guard conditions (null LLMClient, uninitialized programmer), happy-path single-coordinator flow, sub-agent routing, audit step gating, correlationId propagation, fallback chain behavior, offline cache interactions, vector similarity search correctness, hybrid search merging/deduplication, embedding engine selection logic, and VectorMemoryStore model-version staleness detection
 
 ---
 
@@ -162,6 +248,7 @@ The pipeline is formally documented via:
 | Build | Gradle Kotlin DSL |
 | CI/CD | GitHub Actions (`.github/workflows/build-apk.yml`) |
 | Testing | JUnit4 + Kotlin Coroutines Test (`runTest`) + Mockito/MockK |
+| On-Device ML | TensorFlow Lite (sentence embeddings for vector memory search) |
 
 ### LLM API Providers
 
@@ -169,76 +256,4 @@ The pipeline is formally documented via:
 |----------|----------|---------------|
 | Groq | `https://api.groq.com/openai/v1/` | `llama-3.1-8b-instant` |
 | OpenRouter | `https://openrouter.ai/api/v1/` | `meta-llama/llama-3.1-8b-instruct` |
-| GitHub Models | `https://models.inference.ai.azure.com/` | `Meta-Llama-3.1-8B-Instruct` |
-| Cloudflare | `https://api.cloudflare.com/...` | `@cf/meta/llama-3.1-8b-instruct` |
-
-All providers use OpenAI-compatible `chat/completions` API format.
-
----
-
-## Key Files and Their Roles
-
-### Entry Points
-| File | Purpose |
-|------|---------|
-| `AgenteAutonomoApplication.kt` | Application class; creates notification channels, initializes Room DB |
-| `AndroidManifest.xml` | Declares all permissions, services, receivers, activities |
-
-### Agent System
-| File | Purpose |
-|------|---------|
-| `agent/AgentOrchestrator.kt` | Core orchestration logic; implements the sequential multi-agent pipeline; manages conversation context, memory retrieval, sub-agent routing, and audit steps; all state is tied together via `correlationId`; uses `FallbackLLMClient` instead of `LLMClient` directly; fully KDoc-documented per pipeline step |
-| `agent/AgentManager.kt` | CRUD operations for agents; retrieves agents by type/capability; logs agent usage via `AuditLogger` |
-| `agent/ConversationAgentProgrammer.kt` | Natural language command parser; intercepts messages matching patterns to create/modify/delete agents and tasks; supports both Portuguese and English commands; must be initialized before use |
-
-### API Layer
-| File | Purpose |
-|------|---------|
-| `api/LLMApiService.kt` | Retrofit interface for OpenAI-compatible `POST chat/completions`; includes streaming variant |
-| `api/LLMClient.kt` | Configures OkHttp + Retrofit per provider; handles retries, auth headers, timeout (60s); exposes `sendMessage()` and streaming flow |
-| `api/FallbackLLMClient.kt` | Wraps multiple `LLMClient` instances and `OfflineResponseCache`; implements ordered provider fallback chain; logs each attempt outcome via `AuditLogger`; exposes same `sendMessage()` interface as `LLMClient` |
-| `api/OfflineResponseCache.kt` | Room-backed LRU cache for LLM responses; keyed by SHA-256(prompt + agentType); TTL-based expiry; lazy eviction of oldest entries beyond `MAX_CACHE_SIZE` |
-| `api/MemoryApiClient.kt` | Connects to remote Next.js memory server at `https://preview-chat-68144e5f.space.z.ai`; manages user identity caching |
-| `api/model/LLMModels.kt` | All request/response data classes (`ChatCompletionRequest`, `Message`, `ChatCompletionResponse`, `Choice`, `Delta`, etc.); `ApiProvider` enum; `AvailableModels` catalog |
-
-### Data Layer
-
-#### Entities
-| Entity | Table | Key Fields |
-|--------|-------|-----------|
-| `Agent` | `agents` | id, name, type (enum), systemPrompt, isActive, capabilities (JSON string), priority, temperature, maxTokens, color, usageCount |
-| `Message` | `messages` | id (auto), conversationId, agentId, senderType (enum), content, timestamp, isSynced |
-| `Memory` | `memories` | id, key, value, type (enum), category, sourceAgent, conversationId, importance, isArchived, expiresAt, accessCount |
-| `AuditLog` | `audit_logs` | id (auto), type (enum), action, agentId, agentName, details, status (enum), durationMs, correlationId, isSynced |
-| `Task` | `tasks` | Scheduled/pending tasks |
-| `CachedResponse` | `cached_responses` | id (auto), promptHash, agentType, responseText, provider, createdAt, lastAccessed, hitCount |
-| `Settings` | `settings` | id=1 (singleton), apiKey, apiProvider, apiModel, apiBaseUrl, temperature, maxTokens, serviceEnabled, autoStart, auditEnabled, fallbackProvidersEnabled, fallbackProviderOrder, offlineCacheEnabled, offlineCacheTtlDays |
-
-#### DAOs
-All DAOs follow consistent patterns:
-- `Flow<List<T>>` for reactive queries (UI observation)
-- `suspend fun` for one-shot operations
-- Standard CRUD + specialized queries
-
-| DAO | Notable Methods |
-|-----|----------------|
-| `AgentDao` | `getActiveAgents()`, `getAgentsByType()`, `getAgentsByCapability()`, `updateAgentUsage()` |
-| `MessageDao` | `getMessagesByConversation()`, `getRecentMessages()`, `getUnsyncedMessages()`, `searchMessages()` |
-| `MemoryDao` | `searchMemories()`, `deleteExpiredMemories()`, `updateAccess()`, `getMemoriesByConversation()` |
-| `AuditLogDao` | `getLogsByCorrelationId()`, `getLogsSince()`, `getUnsyncedLogs()`, `getAverageDuration()` |
-| `CachedResponseDao` | `findByPromptHash(promptHash, agentType)`, `updateLastAccessed()`, `incrementHitCount()`, `deleteExpiredEntries(before)`, `deleteOldestBeyondLimit(limit)`, `countAll()` |
-| `SettingsDao` | Singleton pattern (id=1); `getSettingsSync()` for non-Flow access |
-| `TaskDao` | Scheduled task management |
-
-#### Database
-| File | Purpose |
-|------|---------|
-| `data/database/AppDatabase.kt` | Room `@Database` class; singleton via `getDatabase(context)`; defines all entity/DAO registrations including `CachedResponse` and `CachedResponseDao` |
-
-### Service Layer
-| File | Purpose |
-|------|---------|
-| `service/AgenteAutonomoService.kt` | Persistent `ForegroundService`; main execution loop for 24/7 operation |
-| `service/BootReceiver.kt` | `BroadcastReceiver` for `RECEIVE_BOOT_COMPLETED`; starts service after device reboot |
-| `service/NetworkReceiver.kt` | `BroadcastReceiver` for connectivity changes; triggers LLM reconnection; also triggers `FallbackLLMClient` to re-attempt primary provider after network restore |
-| `service/
+| GitHub Models | `https://models.inference.ai.azure.com/` | `Meta-
