@@ -24,4 +24,6 @@ class MemoryRepository(private val dao: MemoryDao) {
     suspend fun touch(id: String, now: Date = Date()) = dao.bumpAccess(id, now)
 
     suspend fun purgeExpired(now: Date = Date()) = dao.purgeExpired(now)
+
+    suspend fun clearAll() = dao.clear()
 }

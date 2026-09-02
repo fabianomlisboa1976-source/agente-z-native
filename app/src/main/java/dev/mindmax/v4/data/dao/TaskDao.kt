@@ -51,4 +51,7 @@ interface TaskDao {
 
     @Query("DELETE FROM tasks WHERE status = 'COMPLETED' AND completed_at < :olderThan")
     suspend fun deleteCompletedOlderThan(olderThan: java.util.Date)
+
+    @Query("DELETE FROM tasks")
+    suspend fun clear()
 }

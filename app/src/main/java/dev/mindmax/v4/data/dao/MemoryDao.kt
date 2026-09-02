@@ -24,6 +24,9 @@ interface MemoryDao {
     @Query("DELETE FROM memories WHERE is_archived = 1 OR (expires_at IS NOT NULL AND expires_at < :now)")
     suspend fun purgeExpired(now: java.util.Date)
 
+    @Query("DELETE FROM memories")
+    suspend fun clear()
+
     @Query("SELECT * FROM memories WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): MemoryEntity?
 

@@ -117,7 +117,14 @@ class SettingsViewModel(application: android.app.Application) : AndroidViewModel
 
     fun clearAllData() {
         viewModelScope.launch {
-            ServiceLocator.auditRepository.clear()
+            // Wipe every table the user-generated runtime data lives in. Agents
+            // and Settings stay — they're configuration, not data. Failures
+            // are isolated: a table that can't be cleared doesn't block the
+            // others.
+            runCatching { ServiceLocator.auditRepository.clear() }
+            runCatching { ServiceLocator.chatRepository.clearAll() }
+            runCatching { ServiceLocator.memoryRepository.clearAll() }
+            runCatching { ServiceLocator.taskRepository.clearAll() }
         }
     }
 

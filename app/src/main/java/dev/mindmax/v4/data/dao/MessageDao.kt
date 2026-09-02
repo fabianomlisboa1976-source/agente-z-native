@@ -26,6 +26,9 @@ interface MessageDao {
     @Query("DELETE FROM messages WHERE timestamp < :olderThan")
     suspend fun deleteOlderThan(olderThan: java.util.Date)
 
+    @Query("DELETE FROM messages")
+    suspend fun clear()
+
     @Query("SELECT * FROM messages WHERE id = :id LIMIT 1")
     suspend fun getById(id: Long): MessageEntity?
 

@@ -64,4 +64,6 @@ class ChatRepository(private val dao: MessageDao) {
     suspend fun deleteConversation(conversationId: String) = dao.deleteConversation(conversationId)
 
     suspend fun pruneOlderThan(cutoff: Date) = dao.deleteOlderThan(cutoff)
+
+    suspend fun clearAll() = dao.clear()
 }

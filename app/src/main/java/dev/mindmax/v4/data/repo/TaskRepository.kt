@@ -29,4 +29,6 @@ class TaskRepository(private val dao: TaskDao) {
     suspend fun delete(id: String) = dao.deleteById(id)
 
     suspend fun deleteCompletedOlderThan(cutoff: Date) = dao.deleteCompletedOlderThan(cutoff)
+
+    suspend fun clearAll() = dao.clear()
 }
