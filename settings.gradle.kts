@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "AgenteAutonomo"
+rootProject.name = "MindMax"
 include(":app")

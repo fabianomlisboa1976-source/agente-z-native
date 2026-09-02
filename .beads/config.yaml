@@ -68,3 +68,5 @@
 sync.remote: "git+https://github.com/fabianomlisboa1976-source/agente-z-native.git"
 dolt:
     shared-server: true
+export:
+    auto: true

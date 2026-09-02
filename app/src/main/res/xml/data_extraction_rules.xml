@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
     <cloud-backup>
-        <include domain="sharedpref" path="."/>
-        <exclude domain="sharedpref" path="secret.xml"/>
+        <exclude domain="database" path="mindmax.db" />
+        <exclude domain="sharedpref" path="mindmax_secure.xml" />
     </cloud-backup>
+    <device-transfer>
+        <exclude domain="database" path="mindmax.db" />
+        <exclude domain="sharedpref" path="mindmax_secure.xml" />
+    </device-transfer>
 </data-extraction-rules>

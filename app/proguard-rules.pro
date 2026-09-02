@@ -1,25 +1,21 @@
-# ProGuard rules for Agente Autonomo App
+# ProGuard / R8 rules for MindMax V4.
+# R8 is currently disabled (isMinifyEnabled = false). These rules are written for the
+# day we turn it on — keep them lean and use them as a checklist.
 
-# Keep Room entities
--keep class com.agente.autonomo.data.entity.** { *; }
-
-# Keep Retrofit models
--keep class com.agente.autonomo.api.model.** { *; }
-
-# Keep Gson
--keepattributes Signature
+# Keep Compose runtime annotations.
 -keepattributes *Annotation*
--dontwarn sun.misc.**
--keep class com.google.gson.** { *; }
+-keepattributes Signature
+-keepattributes InnerClasses
 
-# Keep Retrofit
--keep class retrofit2.** { *; }
--dontwarn retrofit2.**
+# kotlinx-serialization — companion serializer objects are looked up reflectively.
+-keep,includedescriptorclasses class dev.mindmax.v4.**$$serializer { *; }
+-keepclassmembers class dev.mindmax.v4.** {
+    *** Companion;
+}
+-keepclasseswithmembers class dev.mindmax.v4.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
 
-# Keep OkHttp
--keep class okhttp3.** { *; }
--dontwarn okhttp3.**
-
-# Keep Coroutines
--keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
--keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
+# Room — keep entity columns and DAO method signatures stable.
+-keep class dev.mindmax.v4.data.entity.** { *; }
+-keep class dev.mindmax.v4.data.dao.** { *; }
