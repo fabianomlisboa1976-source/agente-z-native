@@ -23,7 +23,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 
 /**
  * Foreground service whose only job is to keep the LLM correlation alive when
@@ -181,12 +180,33 @@ object MindMaxServiceState {
 
 /** Convenience object for callers to start/stop the service from `ServiceLocator.init`. */
 object ServiceStarter {
-    fun ensureStartedIfEnabled(context: Context) {
-        // BootReceiver.onReceive runs on the main thread with a 10s ceiling —
-        // a warm-cached Room read is cheap enough to do synchronously here.
-        val enabled = runBlocking {
-            ServiceLocator.settingsRepository.current()?.serviceEnabled == true
+    /**
+     * Suspend variant kept for callers already inside a coroutine (e.g. a future
+     * boot-completed broadcast that has migrated to goAsync). Reads the
+     * persisted settings off the main thread and acts on the result.
+     */
+    suspend fun ensureStartedIfEnabled(context: Context) {
+        val enabled = ServiceLocator.settingsRepository.current()?.serviceEnabled == true
+        apply(context, enabled)
+    }
+
+    /**
+     * Fire-and-forget version used from `Application.onCreate` and from
+     * `BootReceiver.onReceive`. Hopping to [ServiceLocator.scope] guarantees we
+     * never block the main thread (a Room read on the main thread freezes the
+     * bootstrap; on `BootReceiver` it would exceed the 10s broadcast ceiling
+     * and Android would kill the receiver before we started the service).
+     */
+    fun ensureStartedIfEnabledAsync(context: Context) {
+        ServiceLocator.scope.launch {
+            runCatching {
+                val enabled = ServiceLocator.settingsRepository.current()?.serviceEnabled == true
+                apply(context, enabled)
+            }
         }
+    }
+
+    private fun apply(context: Context, enabled: Boolean) {
         if (enabled) {
             MindMaxForegroundService.start(context)
         } else {

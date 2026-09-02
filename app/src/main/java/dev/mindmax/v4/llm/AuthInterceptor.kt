@@ -12,9 +12,10 @@ import okhttp3.Response
  * to know about it.
  *
  * If the store has no key, the call still proceeds — the upstream provider
- * will return a 401/403, which the LLM layer surfaces as an error. The point
- * of this interceptor is to centralise auth and never have to scatter keys
- * across call sites.
+ * will return a 401/403, which the LLM layer surfaces as an error. We
+ * deliberately omit the `Authorization` header entirely (rather than sending
+ * `Bearer ` with a trailing space) because some providers log malformed auth
+ * headers as 500 instead of 401 and obscure the real cause.
  *
  * @param cloudflareAccountId currently unused at this layer (Cloudflare is
  *   keyed on the URL path which [LlmClient] builds via `resolvedBaseUrl`).
@@ -30,7 +31,10 @@ class AuthInterceptor(
     override fun intercept(chain: Interceptor.Chain): Response {
         val original = chain.request()
         val builder = original.newBuilder()
-            .header("Authorization", "Bearer ${secureKeyStore.getApiKey().orEmpty()}")
+
+        secureKeyStore.getApiKey()?.takeIf { it.isNotBlank() }?.let { key ->
+            builder.header("Authorization", "Bearer $key")
+        }
 
         provider.extraHeaders.forEach { (k, v) -> builder.header(k, v) }
 
