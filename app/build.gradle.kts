@@ -94,5 +94,7 @@ dependencies {
     // Retrofit + OkHttp (used by LlmClient in C3)
     implementation(libs.retrofit.core)
     implementation(libs.retrofit.kotlinx.serialization)
+    implementation(libs.okhttp.core)
+    implementation(libs.okhttp.sse)
     implementation(libs.okhttp.logging)
 }

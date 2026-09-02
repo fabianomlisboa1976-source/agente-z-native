@@ -4,3 +4,10 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# CI/downloaded APK staging dirs
+agente-z-debug-apk/
+agente-z-release-apk/
+
+# Room exported schemas (regenerated on each build; keep locally)
+app/schemas/

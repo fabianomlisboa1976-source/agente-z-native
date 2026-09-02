@@ -14,10 +14,14 @@ import dev.mindmax.v4.data.repo.ChatRepository
 import dev.mindmax.v4.data.repo.MemoryRepository
 import dev.mindmax.v4.data.repo.SettingsRepository
 import dev.mindmax.v4.data.repo.TaskRepository
+import dev.mindmax.v4.llm.LlmClient
+import dev.mindmax.v4.llm.Provider
+import dev.mindmax.v4.llm.ProviderRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.util.Date
 
 /**
@@ -27,7 +31,9 @@ import java.util.Date
  * Exposes:
  *  - an application-scoped [scope] for fire-and-forget work (audit flush, key migration),
  *  - the [database] for one-shot queries that don't yet have a repository,
- *  - typed repositories that wrap each DAO and (for settings) also the secure store.
+ *  - typed repositories that wrap each DAO and (for settings) also the secure store,
+ *  - [llmClient] lazy-resolves per current provider, so a switch is honoured on the
+ *    very next call without an app restart.
  *
  * All accessors are [lateinit] with `private set` — the public read-only surface
  * guarantees no one can swap a single dependency out at runtime.
@@ -61,6 +67,14 @@ object ServiceLocator {
     lateinit var taskRepository: TaskRepository
         private set
 
+    /**
+     * LLM client cache key. Provider changes invalidate the cache so the next
+     * call resolves a fresh client. Synchronised because settings edits can
+     * race with an in-flight chat.
+     */
+    @Volatile private var llmCacheKey: Pair<String, String?>? = null
+    @Volatile private var llmCached: LlmClient? = null
+
     fun init(context: Context) {
         if (initialized) return
         synchronized(this) {
@@ -89,13 +103,50 @@ object ServiceLocator {
             memoryRepository = MemoryRepository(database.memoryDao())
             taskRepository = TaskRepository(database.taskDao())
 
-            // First-launch work — both routines are idempotent, so it's safe to fire on
-            // every launch: seedDefaultsIfEmpty() bails unless the agents table is empty;
-            // migrateLegacyApiKeyIfPresent() bails when the sentinel is already present.
+            // First-launch work — both routines are idempotent so it's safe to
+            // fire on every launch: seedDefaultsIfEmpty() bails unless the agents
+            // table is empty; migrateLegacyApiKeyIfPresent() bails when the
+            // sentinel is already present.
             scope.launch { runCatching { seedFirstLaunchData() } }
             scope.launch { runCatching { settingsRepository.migrateLegacyApiKeyIfPresent() } }
 
             initialized = true
+        }
+    }
+
+    /**
+     * Returns an [LlmClient] tuned for the currently persisted provider. Cached
+     * by `(providerId, cloudflareAccountId)` and rebuilt on cache miss. Reading
+     * the current Settings is synchronous and tiny, but we still expose the
+     * suspend version for callers already inside a coroutine.
+     */
+    fun llmClient(): LlmClient {
+        // runBlocking here is acceptable: Settings.get() is a single Room read
+        // that returns from a warm-cached page; worst-case latency is <5ms.
+        val snapshot = runBlocking {
+            (settingsRepository.current() ?: SettingsEntity.default(Date()))
+        }
+        val provider = ProviderRegistry.provider(snapshot)
+        val accountId = if (provider is Provider.Cloudflare) snapshot.apiBaseUrl else null
+        val key = provider.id to accountId
+        llmCached?.let { cached ->
+            if (llmCacheKey == key) return cached
+        }
+        synchronized(this) {
+            llmCacheKey = key
+            llmCached = LlmClient(
+                provider = provider,
+                accountIdProvider = { accountId },
+            )
+            return llmCached!!
+        }
+    }
+
+    /** Bumps the cache so the next [llmClient] call rebuilds the client. */
+    fun invalidateLlmClient() {
+        synchronized(this) {
+            llmCacheKey = null
+            llmCached = null
         }
     }
 
