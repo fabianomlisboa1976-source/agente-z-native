@@ -15,6 +15,6 @@ class BootReceiver : BroadcastReceiver() {
         if (action != Intent.ACTION_BOOT_COMPLETED && action != "android.intent.action.MY_PACKAGE_REPLACED") {
             return
         }
-        ServiceStarter.ensureStartedIfEnabled(context)
+        ServiceStarter.ensureStartedIfEnabledAsync(context)
     }
 }

@@ -88,7 +88,7 @@ class SettingsViewModel(application: android.app.Application) : AndroidViewModel
         // Best-effort FGS start/stop. ServiceStarter re-reads Settings
         // idempotently on its next call, so a race between save() and the
         // service-side check is harmless.
-        ServiceStarter.ensureStartedIfEnabled(getApplication())
+        ServiceStarter.ensureStartedIfEnabledAsync(getApplication())
     }
 
     fun onAutoStartToggle(value: Boolean) {
