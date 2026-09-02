@@ -17,7 +17,7 @@ object ProviderRegistry {
                 ?: Provider.Groq.baseUrl
             val model = settings?.apiModel?.takeIf { it.isNotBlank() }
                 ?: Provider.Groq.defaultModel
-            Provider.Custom(base, model)
+            Provider.Custom(customBaseUrl = base, customModel = model)
         } else {
             Provider.fromId(id)
         }

@@ -71,13 +71,13 @@ sealed class Provider(
 
     /** User-supplied OpenAI-compatible endpoint (LM Studio, Together, etc.). */
     data class Custom(
-        override val baseUrl: String,
-        override val defaultModel: String,
+        val customBaseUrl: String,
+        val customModel: String,
     ) : Provider(
         id = "custom",
         displayName = "Custom endpoint",
-        baseUrl = baseUrl,
-        defaultModel = defaultModel,
+        baseUrl = customBaseUrl,
+        defaultModel = customModel,
     )
 
     /**

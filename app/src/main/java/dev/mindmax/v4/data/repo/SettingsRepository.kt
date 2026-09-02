@@ -1,6 +1,5 @@
 package dev.mindmax.v4.data.repo
 
-import androidx.room.RoomDatabase
 import dev.mindmax.v4.core.prefs.SecureKeyStore
 import dev.mindmax.v4.data.dao.SettingsDao
 import dev.mindmax.v4.data.db.MindMaxDatabase

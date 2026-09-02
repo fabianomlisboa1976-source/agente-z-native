@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.retryWhen
@@ -79,14 +80,21 @@ class LlmClient(
 
     /** Performs a single non-streamed completion and returns the textual answer. */
     suspend fun chat(spec: RequestSpec): ChatSummary = withContext(Dispatchers.IO) {
-        val req = spec.toChatRequest(stream = false)
+        val req = ChatRequest(
+            model = spec.model.ifBlank { provider.defaultModel },
+            messages = spec.messages,
+            stream = false,
+            temperature = spec.temperature,
+            topP = spec.topP,
+            maxTokens = spec.maxTokens,
+        )
         val response = api.chatCompletions(req)
         response.error?.let { throw LlmException(it.message) }
         val content = response.choices.firstOrNull()?.message?.content
             ?: throw LlmException("Provider returned no message choices.")
         ChatSummary(
             content = content,
-            model = response.model ?: spec.model,
+            model = response.model ?: req.model,
             totalTokens = response.usage?.totalTokens,
         )
     }
@@ -112,8 +120,15 @@ class LlmClient(
      * can render tokens in order. The Flow terminates when the provider sends
      * `[DONE]` or the underlying transport fails.
      */
-    fun stream(spec: RequestSpec): Flow<String> = flow {
-        val req = spec.toChatRequest(stream = true)
+    fun stream(spec: RequestSpec): Flow<String> = flow<String> {
+        val req = ChatRequest(
+            model = spec.model.ifBlank { provider.defaultModel },
+            messages = spec.messages,
+            stream = true,
+            temperature = spec.temperature,
+            topP = spec.topP,
+            maxTokens = spec.maxTokens,
+        )
         val body = json.encodeToString(ChatRequest.serializer(), req)
             .toRequestBody("application/json".toMediaType())
 
@@ -154,23 +169,17 @@ class LlmClient(
         null
     }
 
-    /** Reusable inputs to a chat or stream call. */
+    /**
+     * Reusable inputs to a chat or stream call. Empty [model] means
+     * "use the active provider's [Provider.defaultModel]".
+     */
     data class RequestSpec(
-        val model: String = provider.defaultModel,
+        val model: String = "",
         val messages: List<ChatMessage> = emptyList(),
         val temperature: Float? = null,
         val topP: Float? = null,
         val maxTokens: Int? = null,
-    ) {
-        fun toChatRequest(stream: Boolean): ChatRequest = ChatRequest(
-            model = model,
-            messages = messages,
-            stream = stream,
-            temperature = temperature,
-            topP = topP,
-            maxTokens = maxTokens,
-        )
-    }
+    )
 
     class LlmException(message: String) : RuntimeException(message)
 }
