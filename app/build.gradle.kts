@@ -8,12 +8,12 @@ plugins {
 
 android {
     namespace = "dev.mindmax"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "dev.mindmax"
         minSdk = 26
-        targetSdk = 36
+        targetSdk = 37
         versionCode = 1
         versionName = "4.0.0"
     }
