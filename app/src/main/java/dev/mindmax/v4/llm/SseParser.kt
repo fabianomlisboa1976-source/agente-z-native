@@ -3,6 +3,7 @@ package dev.mindmax.v4.llm
 import kotlinx.serialization.json.Json
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
+import dev.mindmax.v4.llm.LlmClient.LlmException
 
 /**
  * Minimal Server-Sent Events parser hand-rolled for our LLM stream so we can
@@ -43,6 +44,14 @@ object SseParser {
 /**
  * Pass-through EventSourceListener that forwards each delta into a callback.
  * Lives here so the streaming code path stays compact.
+ *
+ * Error handling: OkHttp fires [onFailure] for *both* a transport exception
+ * (`t != null`) and an HTTP non-2xx (`response != null`, `t == null`). The
+ * previous implementation only covered the transport branch — when the
+ * provider returned 401 (e.g. missing API key) or 429 (rate limit), the
+ * response body was silently dropped and the chat UI saw an empty stream.
+ * We now read the response body, surface it as a real exception, and tag
+ * the status code so the chat layer can show something more useful.
  */
 class SseChatListener(
     private val onDelta: (String) -> Unit,
@@ -66,10 +75,36 @@ class SseChatListener(
     }
 
     override fun onFailure(eventSource: EventSource, t: Throwable?, response: okhttp3.Response?) {
-        if (t != null) onError(t)
+        when {
+            t != null -> onError(t)
+            response != null -> onError(asHttpFailure(response))
+            else -> onError(IllegalStateException("SSE stream closed without a cause."))
+        }
     }
 
     override fun onClosed(eventSource: EventSource) {
         onClosed()
+    }
+
+    private fun asHttpFailure(response: okhttp3.Response): Throwable {
+        val code = response.code
+        val bodyText = try {
+            response.body?.string().orEmpty().take(MAX_BODY_CHARS)
+        } catch (_: Throwable) {
+            ""
+        }
+        val summary = when (code) {
+            401, 403 -> "Provedor recusou a chave (HTTP $code). Verifique Configurações → Chave de API."
+            404 -> "Endpoint não encontrado (HTTP 404). Confira o provider/modelo selecionado."
+            429 -> "Limite de requisições do provedor (HTTP 429). Aguarde alguns segundos."
+            in 500..599 -> "Provedor instável (HTTP $code). Tente novamente em instantes."
+            else -> "Falha no streaming (HTTP $code)."
+        }
+        val message = if (bodyText.isNotBlank()) "$summary\n$bodyText" else summary
+        return LlmClient.LlmException(message)
+    }
+
+    private companion object {
+        const val MAX_BODY_CHARS = 400
     }
 }
