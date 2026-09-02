@@ -1,5 +1,6 @@
 package dev.mindmax.v4.ui.chat
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +19,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -95,6 +97,13 @@ fun ChatScreen(
             onSend = viewModel::send,
             enabled = !state.isThinking,
         )
+
+        state.error?.let { message ->
+            ErrorBanner(
+                message = message,
+                onDismiss = viewModel::dismissError,
+            )
+        }
     }
 }
 
@@ -151,6 +160,41 @@ private fun ChatInput(
             IconButton(onClick = onSend, enabled = enabled && text.isNotBlank()) {
                 Icon(Icons.Filled.Send, contentDescription = "Enviar")
             }
+        }
+    }
+}
+
+/**
+ * Inline error banner shown above the input bar when `state.error != null`.
+ * Lifts visibility for failures that, before this fix, were swallowed by the
+ * Compose tree (the value was written to state but never rendered).
+ */
+@Composable
+private fun ErrorBanner(
+    message: String,
+    onDismiss: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp)
+            .background(MaterialTheme.colorScheme.errorContainer),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = message,
+            color = MaterialTheme.colorScheme.onErrorContainer,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+        )
+        IconButton(onClick = onDismiss) {
+            Icon(
+                imageVector = Icons.Filled.Close,
+                contentDescription = "Fechar",
+                tint = MaterialTheme.colorScheme.onErrorContainer,
+            )
         }
     }
 }

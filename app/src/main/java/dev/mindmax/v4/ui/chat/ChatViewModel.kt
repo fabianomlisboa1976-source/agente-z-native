@@ -53,6 +53,16 @@ class ChatViewModel(
         _state.update { it.copy(input = text) }
     }
 
+    /**
+     * Clears the chat error banner after the user dismisses it. The persisted
+     * message is unaffected — only the transient [ChatState.error] field is
+     * zeroed, so the next failure can set a new one without leaking the old
+     * value across the screen.
+     */
+    fun dismissError() {
+        _state.update { it.copy(error = null) }
+    }
+
     fun send() {
         val text = _state.value.input.trim()
         if (text.isEmpty()) return
