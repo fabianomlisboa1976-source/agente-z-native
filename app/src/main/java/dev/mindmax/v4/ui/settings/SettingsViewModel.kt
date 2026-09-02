@@ -1,6 +1,5 @@
 package dev.mindmax.v4.ui.settings
 
-import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.mindmax.v4.core.di.ServiceLocator
@@ -89,7 +88,7 @@ class SettingsViewModel(application: android.app.Application) : AndroidViewModel
         // Best-effort FGS start/stop. ServiceStarter re-reads Settings
         // idempotently on its next call, so a race between save() and the
         // service-side check is harmless.
-        ServiceStarter.ensureStartedIfEnabled(getApplication<Context>())
+        ServiceStarter.ensureStartedIfEnabled(getApplication())
     }
 
     fun onAutoStartToggle(value: Boolean) {
