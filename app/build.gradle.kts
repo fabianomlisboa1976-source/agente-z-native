@@ -1,6 +1,8 @@
+// AGP 9.0+ has built-in Kotlin support — no separate kotlin.android plugin needed.
+// Only the Compose Compiler plugin (org.jetbrains.kotlin.plugin.compose) is required
+// for Compose code generation. See https://kotl.in/gradle/agp-built-in-kotlin
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.compose.compiler)
 }
 
