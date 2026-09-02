@@ -37,7 +37,7 @@ class NetworkObserver(context: Context) {
                 trySend(NetworkState.Unavailable)
             }
         }
-        manager.registerDefaultCallback(callback)
+        manager.registerDefaultNetworkCallback(callback)
         awaitClose { manager.unregisterNetworkCallback(callback) }
     }
 

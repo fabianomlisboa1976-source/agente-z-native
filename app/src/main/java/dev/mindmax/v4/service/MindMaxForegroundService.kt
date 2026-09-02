@@ -10,20 +10,20 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import dev.mindmax.R
 import dev.mindmax.v4.MainActivity
-import dev.mindmax.v4.R
 import dev.mindmax.v4.audit.AuditLogger
 import dev.mindmax.v4.core.di.ServiceLocator
 import dev.mindmax.v4.data.entity.AuditType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 /**
  * Foreground service whose only job is to keep the LLM correlation alive when
@@ -182,13 +182,14 @@ object MindMaxServiceState {
 /** Convenience object for callers to start/stop the service from `ServiceLocator.init`. */
 object ServiceStarter {
     fun ensureStartedIfEnabled(context: Context) {
-        val settings = runCatching { ServiceLocator.settingsRepository.current() }.getOrNull()
-        val enabled = settings?.serviceEnabled == true
+        // BootReceiver.onReceive runs on the main thread with a 10s ceiling —
+        // a warm-cached Room read is cheap enough to do synchronously here.
+        val enabled = runBlocking {
+            ServiceLocator.settingsRepository.current()?.serviceEnabled == true
+        }
         if (enabled) {
             MindMaxForegroundService.start(context)
-        }
-        // Counterintuitive but: when disabled, ensure the service is stopped.
-        else {
+        } else {
             MindMaxForegroundService.stop(context)
         }
     }

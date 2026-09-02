@@ -1,271 +1,176 @@
-# 🤖 Agente Autônomo - APK Android
+# 🧠 MindMax V4 — Multi-agent Android
 
-Um aplicativo Android com **agente autônomo multi-agente** que funciona 24/7, integrado com LLMs gratuitos (Groq, OpenRouter), banco de dados local (Room/SQLite) e sistema de auditoria cruzada.
+MindMax V4 é um aplicativo Android nativo (Kotlin + Jetpack Compose) que roda
+**múltiplos agentes de IA em conjunto** para responder, planejar, pesquisar
+e auditar pedidos do usuário. Foi reescrito do zero a partir do
+`AgenteAutonomo` (V1/V2), com:
+
+- **Jetpack Compose** (Material 3, dark-only).
+- **Room 2.8.4** para persistência (mensagens, agentes, auditoria, memória, tarefas).
+- **Criptografia** da chave de API via `EncryptedSharedPreferences` + Android Keystore.
+- **Streaming de tokens** do LLM via OkHttp SSE.
+- **Múltiplos provedores** gratuitos (Groq, OpenRouter, Cloudflare Workers
+  AI, GitHub Models, OpenAI) + endpoint customizado.
+- **Foreground service opcional** que pode reconectar em background se você
+  habilitar — *off por padrão* por compatibilidade com Android 15.
+
+> **Uso pessoal.** O APK é `release-debug-signed` para uso pessoal — não
+> há restrições do Google Play porque o app não é distribuído pela loja.
 
 ---
 
 ## ✨ Funcionalidades
 
-### 🔄 Execução 24/7
-- **Foreground Service** persistente com notificação
-- Reinicialização automática após boot
-- Reconexão automática quando a internet volta
-- Otimizado para bateria
+### 🤖 Sistema multi-agente
+7 agentes default semeados na primeira execução:
 
-### 🤖 Sistema Multi-Agente
-- **Coordenador**: Orquestra a execução entre agentes
-- **Planejador**: Cria planos e organiza tarefas
-- **Pesquisador**: Busca e analisa informações
-- **Executor**: Executa tarefas práticas
-- **Auditor**: Verifica qualidade e consistência
-- **Memória**: Gerencia contexto e histórico
-- **Comunicação**: Formata e envia mensagens
+| id             | papel                | responsabilidade                          |
+|----------------|----------------------|-------------------------------------------|
+| `coordinator`  | Coordenador          | decide quais agentes usar                 |
+| `planner`      | Planejador           | decompõe pedidos em passos                |
+| `researcher`   | Pesquisador          | reúne contexto                             |
+| `executor`     | Executor             | produz a resposta                          |
+| `auditor`      | Auditor              | revisa consistência e segurança           |
+| `memory`       | Memória              | persiste longo prazo                       |
+| `communication`| Comunicação          | formata a saída                            |
 
-### 🗄️ Banco de Dados Local
-- **Room Database** (SQLite)
-- Mensagens persistentes
-- Histórico de auditoria
-- Memória de longo prazo
-- Tarefas agendadas
+Pipeline: `programmer (slash commands) → persistência → coordinator JSON →
+waves paralelas via async{}.awaitAll() → agregação → cross-audit opcional`.
 
-### 🔗 Integração com LLMs (Gratuitos)
-- **Groq** (recomendado) - Llama 3.1, Mixtral, Gemma
-- **OpenRouter** - 100+ modelos
-- **GitHub Models** - Phi-3, Mistral
-- **Cloudflare Workers AI**
+### 🔗 Provedores LLM suportados
+- **Groq** (free tier generoso; `llama-3.3-70b-versatile` default)
+- **OpenRouter** (free tier com `HTTP-Referer`/`X-Title`)
+- **Cloudflare Workers AI** (precisa de Account ID)
+- **GitHub Models**
+- **OpenAI** (caso você queira usar)
+- **Custom endpoint** (qualquer compatível com OpenAI)
 
-### 🔍 Auditoria Cruzada
-- Logs detalhados de todas as ações
-- Verificação de qualidade das respostas
-- Rastreamento de decisões dos agentes
-- Exportação de logs
+### 🗄️ Banco de dados local (Room)
+- `messages` — chat por `conversationId`
+- `agents` — 7 default + custom; chave é string id
+- `audit_logs` — correlação REQUEST / RESPONSE / AGENT_DECISION / SECURITY / ERROR
+- `settings` — row singleton; `apiKey` é sempre um *sentinel* (`__ENC__:...`)
+- `tasks` — fila de tarefas com status / priority / retries
+- `memories` — long-term context, com TTL opcional
 
-### 📱 Interface
-- Chatbot intuitivo
-- Gerenciamento de agentes
-- Configurações completas
-- Visualização de auditoria
+### 🔒 Segurança
+A chave de API NUNCA toca SQLite em texto puro. O `SettingsEntity.apiKey`
+guarda apenas um sentinel; a chave real fica em
+`EncryptedSharedPreferences` (`mindmax_secure`), com `MasterKey` AES-256-GCM
+gerado pelo **Android Keystore**. Migração automática copia qualquer chave
+legada em texto puro para o store seguro no primeiro launch e grava uma
+entrada `AuditType.SECURITY`.
 
----
+### 📱 Interface Compose
+Single-Activity com `NavigationBar` inferior:
+- **Chat** — `LazyColumn` com bubbles USER/AGENT/SYSTEM + entrada com
+  Send. Auto-scroll, `imePadding`.
+- **Agentes** — lista dos 7 agentes com badge de cor, tipo, prioridade,
+  switch de ativo/inativo.
+- **Auditoria** �� log das últimas 500 entradas com filtro de cor por status.
+- **Configurações** — provider picker, base URL custom, modelo, chave
+  mascarada, sliders temperature/top-p/max-tokens, toggles de
+  multi-agente/cross-audit/serviço/auto-start, danger zone.
 
-## 🚀 COMPILAÇÃO ONLINE (SEM COMPUTADOR)
-
-### MÉTODO 1: GitHub Actions (RECOMENDADO - 100% Gratuito)
-
-Este projeto já está configurado para compilar automaticamente usando **GitHub Actions**. Siga os passos:
-
-#### Passo 1: Criar conta no GitHub
-1. Acesse https://github.com
-2. Clique em "Sign up" e crie uma conta gratuita
-3. Verifique seu email
-
-#### Passo 2: Criar novo repositório
-1. Clique no botão "+" (New repository)
-2. Nome: `AgenteAutonomo`
-3. Selecione "Public" (repositório público = builds gratuitos ilimitados)
-4. Clique em "Create repository"
-
-#### Passo 3: Fazer upload dos arquivos
-**Opção A - Pelo celular (navegador):**
-1. No seu repositório GitHub, clique em "Add file" → "Upload files"
-2. Toque em "choose your files"
-3. Selecione todos os arquivos do projeto (você precisa extrair o .tar.gz primeiro)
-4. Clique em "Commit changes"
-
-**Opção B - Usando GitHub Desktop (se tiver acesso a um computador temporário):**
-```bash
-git clone https://github.com/SEU_USUARIO/AgenteAutonomo.git
-cd AgenteAutonomo
-copie todos os arquivos do projeto aqui
-git add .
-git commit -m "Primeira versão"
-git push origin main
-```
-
-#### Passo 4: Aguardar compilação automática
-1. Após fazer upload, vá na aba "Actions" do seu repositório
-2. O workflow "Build Android APK" iniciará automaticamente
-3. Aguarde 5-10 minutos (você pode acompanhar o progresso em tempo real)
-4. Quando terminar, o APK estará disponível!
-
-#### Passo 5: Baixar o APK
-1. Vá na aba "Actions" → Clique no workflow mais recente
-2. Role até "Artifacts" no final da página
-3. Baixe `app-debug-apk` (versão de debug) ou `app-release-apk` (versão release)
-4. O arquivo .apk estará dentro do zip baixado
-
-#### Passo 6: Instalar no celular
-1. Extraia o APK do arquivo zip
-2. Transfira para seu Xiaomi Redmi 14C
-3. Toque no arquivo para instalar
-4. Conceda as permissões necessárias
+### 🛰️ Background (opt-in)
+`MindMaxForegroundService` (type=`dataSync`, channel
+`mindmax_v4_channel`, IMPORTANCE_LOW) é **off por padrão** no primeiro
+launch. Para ativar: Configurações → Serviço em background = ON.
+`BootReceiver` religa se você marcou também Iniciar automaticamente.
 
 ---
 
-## 📋 Requisitos
+## 🚀 Como instalar
 
-### Para Uso:
-- **Android 8.0+** (API 26+)
-- **Permissões**: Internet, Notificações, Ignorar otimização de bateria
+### 1. Compilar via GitHub Actions (recomendado)
+O workflow em `.github/workflows/build-apk.yml` produz dois APKs:
 
----
+- `mindmax-v4-debug-apk` — instalável, debug-signed.
+- `mindmax-v4-release-apk` — release-debug-signed (instalável, sem minify).
 
-## ⚙️ Configuração Inicial
+Após cada push, abra a aba **Actions** no GitHub → clique na run mais
+recente → faça download do artefato.
 
-### 1. Obter Chave de API (Gratuita)
+> O repositório é público → builds ilimitados no GitHub Actions.
 
-#### Groq (Recomendado):
-1. Acesse: https://console.groq.com
-2. Crie uma conta gratuita
-3. Gere uma API Key
-4. Copie a chave
+### 2. Instalar no celular
+Transfira o APK para o celular e abra-o. O Android vai pedir permissão
+pra instalar de fonte desconhecida (basta permitir uma vez para o
+navegador/gerenciador de arquivos usado).
 
-#### OpenRouter (Alternativa):
-1. Acesse: https://openrouter.ai
-2. Crie uma conta
-3. Gere uma API Key
+### 3. Configurar a chave
+1. Abra o app.
+2. Vá em **Config** (o último item da barra inferior).
+3. Escolha o provedor (ex.: **Groq**).
+4. Cole a chave em "Chave de API" (o campo é mascarado). Toque em **Salvar**.
+5. Volte para **Chat** e envie uma mensagem.
 
-### 2. Configurar o App
+### Comandos rápidos
+- `/help` — lista comandos.
+- `/agents` — descreve os 7 agentes default.
+- `/audit` — aponta para a aba Auditoria.
+- `/reset` — instrução para limpar dados.
 
-1. Abra o app **Agente Autônomo**
-2. Toque em **Configurações**
-3. Selecione o **Provedor de API**
-4. Cole sua **Chave da API**
-5. Selecione o **Modelo** desejado
-6. Toque em **Testar** para verificar a conexão
-7. Toque em **Salvar**
-
-### 3. Iniciar o Serviço
-
-1. Na tela principal, toque em **Iniciar Serviço**
-2. A notificação persistente aparecerá
-3. O agente agora está rodando 24/7!
+Tudo fora desses prefixos vai para o Coordenador.
 
 ---
 
-## 🎯 Como Usar
+## 🛠️ Versões da stack
 
-### Chat
-1. Toque em **Chat** na tela principal
-2. Digite sua mensagem
-3. O agente coordenador analisará e distribuirá para os agentes apropriados
-4. A resposta aparecerá no chat
-
-### Gerenciar Agentes
-1. Toque em **Agentes** na tela principal
-2. Veja todos os agentes disponíveis
-3. Ative/desative agentes conforme necessário
-4. Toque em um agente para ver detalhes
-
-### Auditoria
-1. Toque em **Auditoria** na tela principal
-2. Filtre logs por período (Hoje, Semana, Mês)
-3. Toque em um log para ver detalhes
-4. Exporte logs se necessário
+| Componente          | Versão       | Por quê                                       |
+|---------------------|--------------|------------------------------------------------|
+| Kotlin              | 2.3.10       | 2.4.x ainda não tem KSP estável.               |
+| KSP                 | 2.3.10       | mesmo bloco.                                  |
+| AGP                 | 9.3.0        | required for compileSdk 36/37.                |
+| Gradle              | 9.5.0        | AGP 9.3 mínimo.                                |
+| Room                | 2.8.4        | Room 3.0 dropa suporte a Kotlin 2.3.x.         |
+| Compose BOM         | 2026.08.00   | estável para Compose 1.12.x.                  |
+| JDK                 | 17 (Temurin) | requerido pelo AGP 9.x.                        |
 
 ---
 
-## 🛠️ Estrutura do Projeto
+## 🐛 Solução de problemas
+
+### "Provider returned no message choices."
+- Chave de API ausente ou incorreta. Salve de novo em Configurações.
+- Modelo inválido para o provedor. Troque o campo **Modelo**.
+
+### App não responde após minimizar
+- Foreground service está **off por padrão** (intencional).
+- Ative em Configurações → Serviço em background.
+- Se o OEM (Xiaomi/Oppo/Honor) mata o app: desative otimização
+  de bateria para o MindMax.
+
+### Resposta do Coordenador vira `["executor"]`
+- Esperado quando o LLM retorna JSON inválido (a pipeline cai no
+  fallback). Olhe Auditoria → AGENT_DECISION para ver a saída crua.
+
+### CI falha com `KSP for X is missing`
+Bumpe `ksp = "X"` em `gradle/libs.versions.toml` para a versão exata
+indicada no log do Actions.
+
+---
+
+## 📁 Estrutura
 
 ```
-AgenteAutonomoApp/
-├── app/
-│   ├── src/main/
-│   │   ├── java/com/agente/autonomo/
-│   │   │   ├── data/           # Data Access Objects
-│   │   │   ├── database/       # Room Database
-│   │   │   ├── entity/         # Entidades (Message, Agent, etc)
-│   │   │   ├── service/        # Foreground Service
-│   │   │   ├── agent/          # Sistema Multi-Agente
-│   │   │   ├── api/            # Integração LLM
-│   │   │   ├── ui/             # Interface do Usuário
-│   │   │   └── utils/          # Utilitários
-│   │   ├── res/                # Recursos (layouts, strings, etc)
-│   │   └── AndroidManifest.xml
-│   └── build.gradle.kts
-├── .github/workflows/           # GitHub Actions (compilação automática)
-├── build.gradle.kts
-└── settings.gradle.kts
+app/src/main/java/dev/mindmax/v4
+├── MindMaxApp.kt / MainActivity.kt
+├── core/
+│   ├── di/ServiceLocator.kt
+│   └── prefs/  (SecureKeyStore + AppPrefs)
+├── data/
+│   ├── db/  (MindMaxDatabase, Converters, DefaultAgents)
+│   ├── entity/, dao/, repo/
+├── llm/  (Provider, LlmClient, AuthInterceptor, SseParser…)
+├── agent/ (AgentRuntime, ConversationProgrammer, AgentEvent)
+├── audit/ (AuditLogger)
+├── service/ (MindMaxForegroundService, BootReceiver, NetworkObserver)
+└── ui/  (nav, chat, settings, agents, audit, theme)
 ```
 
 ---
 
-## 🔐 Segurança
+## 📜 Licença
 
-- API Keys são armazenadas localmente no dispositivo
-- Banco de dados local criptografado
-- Auditoria de todas as ações
-- Sem envio de dados para servidores externos (exceto APIs de LLM)
-
----
-
-## 📝 Notas Importantes
-
-### Xiaomi Redmi 14C
-Para garantir funcionamento 24/7 no seu Xiaomi:
-
-1. **Configurações → Apps → Agente Autônomo**
-2. **Bateria → Sem restrições**
-3. **Permissões → Permitir todas**
-4. **Bloqueio de limpeza → Ativar**
-
-### Otimização de Bateria
-O app solicitará permissão para ignorar otimização de bateria. **Aceite** para garantir funcionamento contínuo.
-
-### Consumo de Dados
-O app consome dados apenas quando:
-- Envia mensagens para APIs de LLM
-- Sincroniza dados (se habilitado)
-
----
-
-## 🐛 Solução de Problemas
-
-### Serviço não inicia:
-- Verifique se a otimização de bateria está desabilitada
-- Conceda todas as permissões solicitadas
-- Reinicie o celular
-
-### API retorna erro:
-- Verifique se a chave de API está correta
-- Teste a conexão nas configurações
-- Tente outro provedor de API
-
-### App fecha sozinho:
-- Adicione o app à lista de protegidos (Xiaomi)
-- Desabilite otimização de bateria
-- Verifique se há espaço livre no celular
-
----
-
-## 💰 CUSTO: R$ 0,00
-
-Todas as ferramentas usadas são **gratuitas**:
-- ✅ GitHub (repositório público = builds gratuitos)
-- ✅ GitHub Actions (CI/CD gratuito para projetos públicos)
-- ✅ APIs de LLM (nível gratuito generoso)
-- ✅ Banco de dados local (gratuito)
-
----
-
-## 📞 Suporte
-
-Para dúvidas ou problemas:
-1. Verifique os logs em **Auditoria**
-2. Consulte esta documentação
-3. Verifique a configuração da API
-
----
-
-## 🔄 Atualizações Automáticas
-
-Com o GitHub Actions configurado:
-1. Sempre que você fizer alterações no código e fazer push
-2. O APK será recompilado automaticamente
-3. A nova versão estará disponível na aba Actions
-
----
-
-**Desenvolvido com ❤️ para uso pessoal**
-
-*Versão 1.0.0 - 2024*
+Uso pessoal. Sem garantia. Sem reivindicação.
