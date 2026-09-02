@@ -116,6 +116,7 @@ fun SettingsScreen(
     }
 }
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 private fun ProviderSection(
     selectedProviderId: String,
