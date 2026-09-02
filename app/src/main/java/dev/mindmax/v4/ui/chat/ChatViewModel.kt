@@ -17,6 +17,16 @@ import kotlinx.coroutines.launch
  *
  * The screen is for a single conversation — the [conversationId] defaults to
  * `"default"`; a future multi-conversation flow will swap this out.
+ *
+ * **SSE only runs while the chat surface is in foreground.** The streaming
+ * `Flow<String>` from [LlmClient.stream] is collected on `viewModelScope`,
+ * which Android cancels when [onCleared] fires (i.e. when the ViewModel is
+ * destroyed, typically because the user navigated away from the chat tab).
+ * When that happens the underlying `EventSource` is closed via `awaitClose`.
+ * This is intentional: Android (especially 14+) is quick to throttle
+ * background LLM traffic. The optional foreground service
+ * [dev.mindmax.v4.service.MindMaxForegroundService] keeps the process alive
+ * but doesn't itself drive streaming — only this VM does.
  */
 class ChatViewModel(
     private val conversationId: String = "default",

@@ -1,15 +1,17 @@
 package dev.mindmax.v4.ui.settings
 
-import androidx.lifecycle.ViewModel
+import android.content.Context
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.mindmax.v4.core.di.ServiceLocator
 import dev.mindmax.v4.data.entity.SettingsEntity
+import dev.mindmax.v4.service.ServiceStarter
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-class SettingsViewModel : ViewModel() {
+class SettingsViewModel(application: android.app.Application) : AndroidViewModel(application) {
 
     private val _state = MutableStateFlow(SettingsState())
     val state: StateFlow<SettingsState> = _state
@@ -84,6 +86,10 @@ class SettingsViewModel : ViewModel() {
     fun onServiceToggle(value: Boolean) {
         _state.update { it.copy(serviceEnabled = value) }
         save()
+        // Best-effort FGS start/stop. ServiceStarter re-reads Settings
+        // idempotently on its next call, so a race between save() and the
+        // service-side check is harmless.
+        ServiceStarter.ensureStartedIfEnabled(getApplication<Context>())
     }
 
     fun onAutoStartToggle(value: Boolean) {

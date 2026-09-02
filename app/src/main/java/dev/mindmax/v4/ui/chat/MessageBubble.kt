@@ -27,6 +27,12 @@ import java.util.Locale
  * primary tint; agent messages align left with the surface tint; system
  * messages span full width with muted text. Each bubble shows a name prefix
  * and a short timestamp.
+ *
+ * **Markdown is currently rendered as plain text.** Code blocks, links, and
+ * lists come through literal. Upgrade path: pipe `message.content` through a
+ * `AnnotatedString` builder (e.g. `androidx.compose.ui.text.markdown` or a
+ * third-party library) and emit the styled string here. Keep the `bodyMedium`
+ * style as the base — agents' pt-BR replies usually start with prose.
  */
 @Composable
 fun MessageBubble(
