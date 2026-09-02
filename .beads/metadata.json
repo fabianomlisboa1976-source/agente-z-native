@@ -1,0 +1,9 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "agente_z_native_eb13f3e6",
+  "project_id": "f55f9eba-515a-4e09-83e2-c11ac55eda3d",
+  "global_dolt_database": "beads_global",
+  "global_project_id": "00000000-0000-0000-0000-000000000000"
+}
